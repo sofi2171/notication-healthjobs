@@ -1,10 +1,10 @@
-import express from 'express';
+  import express from 'express';
 import cors from 'cors';
 import admin from 'firebase-admin';
 
 const app = express();
 
-// 1. Firebase Admin Init (Vercel Environment Variable se)
+// 1. Firebase Admin Init 
 if (!admin.apps.length) {
     try {
         const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -25,43 +25,61 @@ app.use(express.json());
 
 // 3. Main Route (/api/server)
 app.all('/api/server', async (req, res) => {
-    // GET request - Testing ke liye
+    
     if (req.method === 'GET') {
         return res.status(200).send("API is Live and Ready!");
     }
 
-    // POST request - Notification bhejne ke liye
     if (req.method === 'POST') {
         try {
-            const { title, hospital } = req.body;
+            // Frontend se postId aur senderPhoto bhi receive karein
+            const { title, hospital, postId, senderPhoto } = req.body;
             console.log("New Post Received. Title:", title, "Hospital:", hospital);
 
-            const tokens = [];
+            let tokens = [];
             const usersSnapshot = await db.collection('users').get();
             
-            console.log("Total Users found in Database:", usersSnapshot.size);
-
             usersSnapshot.forEach(doc => {
                 const userData = doc.data();
                 if (userData.fcmToken) {
-                    tokens.push(userData.fcmToken);
+                    // Agar array of tokens hai to spread karein, warna single push
+                    if (Array.isArray(userData.fcmToken)) {
+                        tokens.push(...userData.fcmToken);
+                    } else {
+                        tokens.push(userData.fcmToken);
+                    }
                 }
             });
 
-            console.log("Valid FCM Tokens found:", tokens.length);
+            // FIX 1: Remove Duplicate Tokens
+            // Agar ek user ka token 2 baar save ho gaya ho, to ye usay 1 kar dega
+            const uniqueTokens = [...new Set(tokens)];
+            console.log("Unique FCM Tokens found:", uniqueTokens.length);
 
-            if (tokens.length === 0) {
+            if (uniqueTokens.length === 0) {
                 console.log("No tokens available to send notifications.");
                 return res.status(200).json({ success: false, message: "No tokens found" });
             }
 
-            // Notification ka Message Data
+            // FIX 2, 3 & 4: Professional English, Icon, and Click Link
             const message = {
                 notification: {
-                    title: `Nayi Job: ${title}`,
-                    body: `${hospital} ne Health Jobs par post lagayi hai.`
+                    title: `New Opportunity: ${title}`,
+                    body: `${hospital} has posted a new job. Tap to view details.`
                 },
-                tokens: tokens 
+                webpush: {
+                    notification: {
+                        icon: senderPhoto || "https://via.placeholder.com/150", // Circular picture
+                    },
+                    fcmOptions: {
+                        // Click karne par kahan redirect karna hai (Apna URL set karein)
+                        link: `https://jobs-portal.web.app/job-details.html?id=${postId}` 
+                    }
+                },
+                data: {
+                    postId: String(postId) // App ke andar data handle karne ke liye
+                },
+                tokens: uniqueTokens 
             };
 
             // Notification Bhejna
