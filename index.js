@@ -26,20 +26,26 @@ app.get('/api/server', (req, res) => res.send("✅ API is Live!"));
 
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTE 1 — POST NOTIFICATION  (/api/server)
-// simple.html se general post ka notification
+// جب کوئی نئی پوسٹ کرے تو باقی سب یوزرز کو نوٹیفکیشن جائے
+// پوسٹ کرنے والے کو خود نوٹیفکیشن نہ جائے
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/server', async (req, res) => {
     try {
-        // ✅ FIX 1: body field bhi lo (description ke liye)
-        // ✅ FIX 2: senderPhoto bhi lo (poster ki real pic ke liye)
-        const { title, hospital, body, postId, senderPhoto } = req.body;
+        const { title, hospital, body, postId, senderPhoto, posterId } = req.body;
 
-        console.log("📢 Post Notification:", { title, hospital, postId });
+        console.log("📢 Post Notification:", { title, hospital, postId, posterId });
 
-        // ✅ FIX 3: Sabhi users ke tokens collect karo
+        if (!postId) {
+            return res.status(400).json({ success: false, message: "postId is required" });
+        }
+
+        // ✅ سب یوزرز کے tokens اکٹھے کرو — لیکن poster کو خود نوٹیفکیشن نہ جائے
         let tokens = [];
         const usersSnapshot = await db.collection('users').get();
         usersSnapshot.forEach(doc => {
+            // ✅ پوسٹ کرنے والے کو خود نوٹیفکیشن نہ جائے
+            if (posterId && doc.id === posterId) return;
+
             const token = doc.data().fcmToken;
             if (token) {
                 if (Array.isArray(token)) tokens.push(...token);
@@ -54,45 +60,45 @@ app.post('/api/server', async (req, res) => {
             return res.status(200).json({ success: false, message: "No tokens found" });
         }
 
-        // ✅ FIX 4: Notification title mein hospital/poster name sahi aaye
-        //           body mein post ki description aaye
-        //           click karne par sahi post detail page khule
+        // ✅ پوسٹ ڈیٹیلز پیج کا link
         const clickUrl = `https://healthjobs-portal.web.app/details.html?id=${postId}`;
 
         const message = {
             notification: {
                 title: `${hospital || 'Health Jobs'}: ${title || 'New Medical Update'}`,
-                body:  body || 'Tap to view the latest healthcare update.'
+                body: body ? (body.length > 100 ? body.substring(0, 100) + '...' : body) : 'Tap to view the latest healthcare update.'
             },
 
-            // ✅ FIX 5: webpush ke liye icon aur click link
+            // ✅ Web push — icon پوسٹ کرنے والے کی اصل pic اور click سے سہی پوسٹ پر جائے
             webpush: {
                 notification: {
-                    icon:  senderPhoto || 'https://healthjobs-portal.web.app/images/logo.png',
+                    icon: senderPhoto && senderPhoto.startsWith('http')
+                        ? senderPhoto
+                        : 'https://healthjobs-portal.web.app/images/logo.png',
                     badge: 'https://healthjobs-portal.web.app/images/logo.png',
-                    click_action: clickUrl
+                    requireInteraction: false
                 },
                 fcmOptions: {
-                    link: clickUrl
+                    link: clickUrl   // ✅ کلک کرنے پر سہی پوسٹ ڈیٹیل پیج کھلے
                 }
             },
 
-            // ✅ FIX 6: Android ke liye click action — iske bina click kaam nahi karta
+            // ✅ Android
             android: {
                 priority: 'high',
                 notification: {
-                    icon:         'ic_notification',
-                    color:        '#0a66c2',
-                    click_action: 'FLUTTER_NOTIFICATION_CLICK',
-                    channel_id:   'high_importance_channel'
+                    icon: 'ic_notification',
+                    color: '#0a66c2',
+                    channel_id: 'high_importance_channel',
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
                 }
             },
 
-            // ✅ FIX 7: data payload mein postId taake app side par redirect ho sake
+            // ✅ data payload — app side redirect کے لیے
             data: {
-                postId:    String(postId   || ''),
-                type:      'general_post',
-                clickUrl:  clickUrl
+                postId:   String(postId || ''),
+                type:     'general_post',
+                clickUrl: clickUrl
             },
 
             tokens: uniqueTokens
@@ -101,18 +107,16 @@ app.post('/api/server', async (req, res) => {
         const response = await admin.messaging().sendEachForMulticast(message);
         console.log("✅ Sent:", response.successCount, "❌ Failed:", response.failureCount);
 
-        // ✅ Failed tokens ko Firestore se hata do (invalid tokens saaf)
+        // ✅ Invalid tokens Firestore سے ہٹاؤ
         if (response.failureCount > 0) {
-            const batch = db.batch();
             response.responses.forEach((resp, idx) => {
                 if (!resp.success) {
                     const errCode = resp.error?.code;
-                    // Sirf permanently invalid tokens delete karo
                     if (
                         errCode === 'messaging/invalid-registration-token' ||
                         errCode === 'messaging/registration-token-not-registered'
                     ) {
-                        console.warn("🗑️ Invalid token removed:", uniqueTokens[idx]);
+                        console.warn("🗑️ Invalid token:", uniqueTokens[idx]);
                     }
                 }
             });
@@ -131,58 +135,64 @@ app.post('/api/server', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// ROUTE 2 — CHAT REQUEST NOTIFICATION  (/api/chat)
-// Jab koi naya chat request bheje, target user ko notification jaye
+// ROUTE 2 — CHAT MESSAGE NOTIFICATION  (/api/chat)
+// جب کوئی نیا میسج بھیجے — صرف receiver کو نوٹیفکیشن جائے
+// کلک کرنے پر chat.html کھلے اسی user کے ساتھ
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/chat', async (req, res) => {
     try {
         const { targetToken, senderName, senderUid, senderPhoto, roomId } = req.body;
 
-        console.log("💬 Chat Request Notification:", { senderName, senderUid, roomId });
+        console.log("💬 Chat Notification:", { senderName, senderUid, roomId });
 
         if (!targetToken) {
             return res.status(400).json({ error: "targetToken is required" });
         }
+        if (!senderUid) {
+            return res.status(400).json({ error: "senderUid is required" });
+        }
 
-        // ✅ Sirf ek notification — double notification nahi aayega
-        //    kyunki hum targetToken ko directly use kar rahe hain (broadcast nahi)
+        // ✅ کلک کرنے پر اسی user کے ساتھ chat کھلے
         const clickUrl = `https://healthjobs-portal.web.app/chat.html?uid=${senderUid}`;
 
         const message = {
             notification: {
-                title: `${senderName || 'Healthcare User'} sent you a message`,
-                body:  'Tap to open the conversation'
+                title: `💬 ${senderName || 'Healthcare User'}`,
+                body: 'You have a new message. Tap to reply.'
             },
 
+            // ✅ icon sender کی اصل pic
             webpush: {
                 notification: {
-                    icon:  senderPhoto || 'https://healthjobs-portal.web.app/images/logo.png',
+                    icon: senderPhoto && senderPhoto.startsWith('http')
+                        ? senderPhoto
+                        : 'https://healthjobs-portal.web.app/images/logo.png',
                     badge: 'https://healthjobs-portal.web.app/images/logo.png',
-                    click_action: clickUrl
+                    requireInteraction: false
                 },
                 fcmOptions: {
-                    link: clickUrl
+                    link: clickUrl   // ✅ کلک سے chat.html کھلے
                 }
             },
 
             android: {
                 priority: 'high',
                 notification: {
-                    icon:         'ic_notification',
-                    color:        '#0a66c2',
-                    click_action: 'FLUTTER_NOTIFICATION_CLICK',
-                    channel_id:   'high_importance_channel'
+                    icon: 'ic_notification',
+                    color: '#0a66c2',
+                    channel_id: 'high_importance_channel',
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
                 }
             },
 
             data: {
-                type:      'chat_request',
+                type:      'chat_message',
                 senderUid: String(senderUid || ''),
                 roomId:    String(roomId    || ''),
                 clickUrl:  clickUrl
             },
 
-            token: targetToken   // ✅ broadcast nahi, sirf ek user ko
+            token: targetToken  // ✅ صرف ایک receiver کو
         };
 
         const r = await admin.messaging().send(message);
@@ -198,18 +208,19 @@ app.post('/api/chat', async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTE 3 — CALL NOTIFICATION  (/api/call)
-// Data-only — app band ho tab bhi kaam karta hai
+// کال کا نوٹیفکیشن — صرف جس کو کال کی اسی کو جائے
+// کلک کرنے پر chat.html کھلے incoming call کے ساتھ
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/call', async (req, res) => {
     try {
-        const { targetToken, callerName, callerUid, callType, action } = req.body;
+        const { targetToken, callerName, callerUid, callerPhoto, callType, action } = req.body;
         console.log("📞 Call request:", { callerName, callerUid, callType, action });
 
         if (!targetToken) {
             return res.status(400).json({ error: "targetToken is required" });
         }
 
-        // ✅ Cancel call
+        // ✅ Cancel call — صرف data signal بھیجو
         if (action === 'cancel') {
             const msg = {
                 data: {
@@ -224,30 +235,69 @@ app.post('/api/call', async (req, res) => {
             return res.status(200).json({ success: true, type: 'cancel' });
         }
 
-        // ✅ Incoming call — data-only (notification key bilkul nahi)
+        // ✅ Incoming call notification
+        // کلک کرنے پر chat.html کھلے اور call شروع ہو
+        const clickUrl = `https://healthjobs-portal.web.app/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
+
+        const callEmoji = callType === 'video' ? '🎥' : '📞';
+        const callText  = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
+
         const msg = {
+            // ✅ notification block — تاکہ title/body صحیح دکھے
+            notification: {
+                title: `${callEmoji} ${callerName || 'Health Jobs User'}`,
+                body:  callText
+            },
+
+            // ✅ web push — caller کی اصل pic icon میں
+            webpush: {
+                notification: {
+                    icon: callerPhoto && callerPhoto.startsWith('http')
+                        ? callerPhoto
+                        : 'https://healthjobs-portal.web.app/images/logo.png',
+                    badge: 'https://healthjobs-portal.web.app/images/logo.png',
+                    requireInteraction: true  // ✅ call notification dismiss نہ ہو جلدی
+                },
+                fcmOptions: {
+                    link: clickUrl   // ✅ کلک سے incoming call screen کھلے
+                }
+            },
+
+            android: {
+                priority: 'high',
+                ttl:      '30s',
+                notification: {
+                    icon:         'ic_notification',
+                    color:        '#0a66c2',
+                    channel_id:   'high_importance_channel',
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                }
+            },
+
+            // ✅ data payload — app side کال handle کرنے کے لیے
             data: {
                 isCall:     'true',
                 callerUid:  String(callerUid  || ''),
                 callerName: String(callerName || 'Health Jobs User'),
-                callType:   String(callType   || 'audio')
+                callType:   String(callType   || 'audio'),
+                clickUrl:   clickUrl
             },
-            android: { priority: 'high', ttl: '30s' },
-            token: targetToken
+
+            token: targetToken  // ✅ صرف جس کو کال کی اسی کو
         };
 
         const r = await admin.messaging().send(msg);
-        console.log("✅ Call sent:", r);
+        console.log("✅ Call notification sent:", r);
         return res.status(200).json({ success: true, type: 'call' });
 
     } catch (error) {
-        console.error("❌ Call error:", error.message);
+        console.error("❌ Call Notification Error:", error.message);
         return res.status(500).json({ error: error.message });
     }
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// ROUTE 4 — /api  (backward compat — purana code ke liye)
+// ROUTE 4 — /api  (backward compat — پرانے کوڈ کے لیے)
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api', async (req, res) => {
     const { targetToken, callerName, callerUid, callType, action } = req.body;
@@ -272,14 +322,37 @@ app.post('/api', async (req, res) => {
     }
 
     try {
+        const clickUrl = `https://healthjobs-portal.web.app/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
+        const callEmoji = callType === 'video' ? '🎥' : '📞';
+        const callText  = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
+
         const msg = {
+            notification: {
+                title: `${callEmoji} ${callerName || 'Health Jobs User'}`,
+                body:  callText
+            },
+            webpush: {
+                notification: {
+                    icon:  'https://healthjobs-portal.web.app/images/logo.png',
+                    badge: 'https://healthjobs-portal.web.app/images/logo.png',
+                    requireInteraction: true
+                },
+                fcmOptions: { link: clickUrl }
+            },
+            android: {
+                priority: 'high',
+                ttl: '30s',
+                notification: {
+                    channel_id: 'high_importance_channel',
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                }
+            },
             data: {
                 isCall:     'true',
                 callerUid:  String(callerUid  || ''),
                 callerName: String(callerName || 'Health Jobs User'),
                 callType:   String(callType   || 'audio')
             },
-            android: { priority: 'high', ttl: '30s' },
             token: targetToken
         };
         await admin.messaging().send(msg);
