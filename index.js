@@ -21,16 +21,34 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ─── Constants ────────────────────────────────────────────────────────────
-const BASE_URL        = 'https://healthjobs-portal.web.app';
-const LOGO_URL        = `${BASE_URL}/images/logo.png`;
-const RATE_WINDOW_MS  = 10 * 60 * 1000;   // 10 منٹ
-const RATE_LIMIT      = 5;                  // ایک window میں زیادہ سے زیادہ individual notifications
-const DAILY_MAX       = 10;                 // ایک دن میں زیادہ سے زیادہ notifications per user
+const BASE_URL       = 'https://healthjobs-portal.web.app';
+const LOGO_URL       = `${BASE_URL}/images/logo.png`;
+const RATE_WINDOW_MS = 10 * 60 * 1000;  // 10 منٹ
+const RATE_LIMIT     = 5;
+const DAILY_MAX      = 10;
 
 // ─── Health Check ──────────────────────────────────────────────────────────
-app.get('/',          (req, res) => res.send("✅ Health Jobs API is Live!"));
-app.get('/api/server',(req, res) => res.send("✅ API is Live!"));
+app.get('/',           (req, res) => res.send("✅ Health Jobs API is Live!"));
+app.get('/api/server', (req, res) => res.send("✅ API is Live!"));
 
+
+// ══════════════════════════════════════════════════════════════════════════
+// HELPER: HTML tags اور entities صاف کرو - plain text بناؤ
+// ✅ FIX: notification body میں &nbsp;<p>...</p> آنے کا مسئلہ حل
+// ══════════════════════════════════════════════════════════════════════════
+function stripHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/<[^>]*>/g, '')         // HTML tags ہٹاؤ
+        .replace(/&nbsp;/g, ' ')         // &nbsp; → space
+        .replace(/&amp;/g, '&')          // &amp; → &
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/\s+/g, ' ')            // multiple spaces → single
+        .trim();
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER: valid icon URL یا logo fallback
@@ -39,19 +57,15 @@ function getIcon(photo) {
     return photo && photo.startsWith('http') ? photo : LOGO_URL;
 }
 
-
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER: per-user daily count چیک کرو اور بڑھاؤ
-// returns true  → notification بھیجنا ٹھیک ہے
-// returns false → daily limit پوری ہو گئی، skip کرو
 // ══════════════════════════════════════════════════════════════════════════
 async function checkAndIncrementDailyCount(uid) {
-    const today = new Date().toISOString().split('T')[0];  // YYYY-MM-DD
+    const today = new Date().toISOString().split('T')[0];
     const ref   = db.collection('notif_daily_counts').doc(`${uid}_${today}`);
-
     try {
         const result = await db.runTransaction(async (tx) => {
-            const snap = await tx.get(ref);
+            const snap  = await tx.get(ref);
             const count = snap.exists ? (snap.data().count || 0) : 0;
             if (count >= DAILY_MAX) return false;
             tx.set(ref, { count: count + 1, uid, date: today }, { merge: true });
@@ -60,23 +74,20 @@ async function checkAndIncrementDailyCount(uid) {
         return result;
     } catch (e) {
         console.error("❌ Daily count error:", e.message);
-        return true; // error پر block نہ کرو
+        return true;
     }
 }
 
-
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER: post notification deduplication
-// postId کے لیے صرف ایک بار notification جائے
-// returns true  → پہلی بار ہے، بھیجو
-// returns false → پہلے بھیج چکے، skip کرو
+// ✅ FIX: ایک postId کا notification صرف ایک بار جائے
 // ══════════════════════════════════════════════════════════════════════════
 async function acquirePostLock(postId) {
-    const ref = db.collection('notif_sent_posts').doc(postId);
+    const ref = db.collection('notif_sent_posts').doc(String(postId));
     try {
         const result = await db.runTransaction(async (tx) => {
             const snap = await tx.get(ref);
-            if (snap.exists) return false;  // پہلے بھیج چکے
+            if (snap.exists) return false;
             tx.set(ref, { sentAt: Date.now() });
             return true;
         });
@@ -87,31 +98,44 @@ async function acquirePostLock(postId) {
     }
 }
 
-
 // ══════════════════════════════════════════════════════════════════════════
-// HELPER: rate window چیک کرو — bundled notification کی ضرورت ہے؟
-// Firestore میں ہر uid کے لیے window track کرو
-// returns { shouldBundle: false }  → individual notification بھیجو
-// returns { shouldBundle: true, count, posts } → bundled بھیجو
+// HELPER: chat notification deduplication
+// ✅ FIX: ایک ہی chat message کا notification بار بار نہ جائے
+// ──────────────────────────────────────────────────────────────────────────
+// chatId = `${senderUid}_${receiverUid}_${timestamp_rounded_to_5s}`
 // ══════════════════════════════════════════════════════════════════════════
-async function checkRateWindow(uid, postEntry) {
-    const ref     = db.collection('notif_rate_windows').doc(uid);
-    const nowMs   = Date.now();
-    const cutoff  = nowMs - RATE_WINDOW_MS;
-
+async function acquireChatLock(senderUid, receiverUid) {
+    const window5s = Math.floor(Date.now() / 5000);  // 5 سیکنڈ کی window
+    const lockKey  = `chat_${senderUid}_${receiverUid}_${window5s}`;
+    const ref      = db.collection('notif_chat_locks').doc(lockKey);
     try {
         const result = await db.runTransaction(async (tx) => {
-            const snap    = await tx.get(ref);
-            let entries   = snap.exists ? (snap.data().entries || []) : [];
+            const snap = await tx.get(ref);
+            if (snap.exists) return false;  // پہلے 5 سیکنڈ میں بھیج چکے
+            tx.set(ref, { sentAt: Date.now() });
+            return true;
+        });
+        return result;
+    } catch (e) {
+        console.error("❌ Chat lock error:", e.message);
+        return true;
+    }
+}
 
-            // پرانے entries ہٹاؤ جو window سے باہر ہیں
-            entries = entries.filter(e => e.ts > cutoff);
-
-            // نئی entry شامل کرو
+// ══════════════════════════════════════════════════════════════════════════
+// HELPER: rate window چیک کرو
+// ══════════════════════════════════════════════════════════════════════════
+async function checkRateWindow(uid, postEntry) {
+    const ref    = db.collection('notif_rate_windows').doc(uid);
+    const nowMs  = Date.now();
+    const cutoff = nowMs - RATE_WINDOW_MS;
+    try {
+        const result = await db.runTransaction(async (tx) => {
+            const snap   = await tx.get(ref);
+            let entries  = snap.exists ? (snap.data().entries || []) : [];
+            entries      = entries.filter(e => e.ts > cutoff);
             entries.push({ ts: nowMs, ...postEntry });
-
             tx.set(ref, { entries }, { merge: false });
-
             if (entries.length > RATE_LIMIT) {
                 return { shouldBundle: true, count: entries.length, posts: entries };
             }
@@ -124,7 +148,6 @@ async function checkRateWindow(uid, postEntry) {
     }
 }
 
-
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER: invalid tokens Firestore سے ہٹاؤ
 // ══════════════════════════════════════════════════════════════════════════
@@ -135,15 +158,11 @@ async function removeInvalidTokens(responses, tokens) {
         'messaging/invalid-registration-token',
         'messaging/registration-token-not-registered'
     ];
-
     for (let i = 0; i < responses.length; i++) {
         const resp = responses[i];
         if (!resp.success && badCodes.includes(resp.error?.code)) {
-            console.warn("🗑️ Removing invalid token:", tokens[i]);
-            // تمام users میں یہ token تلاش کرو اور ہٹاؤ
             try {
-                const snap = await db.collection('users')
-                    .where('fcmToken', '==', tokens[i]).get();
+                const snap = await db.collection('users').where('fcmToken', '==', tokens[i]).get();
                 snap.forEach(doc => {
                     batch.update(doc.ref, { fcmToken: admin.firestore.FieldValue.delete() });
                     removed++;
@@ -153,32 +172,25 @@ async function removeInvalidTokens(responses, tokens) {
     }
     if (removed > 0) {
         await batch.commit();
-        console.log(`🗑️ Removed ${removed} invalid token(s) from Firestore`);
+        console.log(`🗑️ Removed ${removed} invalid token(s)`);
     }
 }
 
-
 // ══════════════════════════════════════════════════════════════════════════
-// HELPER: تمام users کے tokens اکٹھے کرو (poster کو چھوڑ کر)
-// returns Map: uid → { tokens: [], dailyOk: bool }
+// HELPER: تمام users کے tokens اکٹھے کرو
 // ══════════════════════════════════════════════════════════════════════════
 async function collectUserTokens(excludeUid = null) {
     const usersSnap = await db.collection('users').get();
     const userMap   = new Map();
-
     usersSnap.forEach(doc => {
         if (excludeUid && doc.id === excludeUid) return;
-        const data  = doc.data();
-        const raw   = data.fcmToken;
+        const data   = doc.data();
+        const raw    = data.fcmToken;
         if (!raw) return;
-
-        const tokens = (Array.isArray(raw) ? raw : [raw])
-            .filter(t => t && t.length > 10);
+        const tokens = (Array.isArray(raw) ? raw : [raw]).filter(t => t && t.length > 10);
         if (tokens.length === 0) return;
-
         userMap.set(doc.id, { tokens });
     });
-
     return userMap;
 }
 
@@ -191,143 +203,98 @@ app.post('/api/server', async (req, res) => {
         const { title, hospital, body, postId, postSlug, senderPhoto, posterId } = req.body;
         console.log("📢 Post Notification:", { title, hospital, postId, postSlug, posterId });
 
-        if (!postId) {
-            return res.status(400).json({ success: false, message: "postId is required" });
-        }
+        if (!postId) return res.status(400).json({ success: false, message: "postId is required" });
 
-        // ─── Deduplication: ایک postId کا notification صرف ایک بار ───
+        // ✅ FIX: ایک postId کا notification صرف ایک بار
         const locked = await acquirePostLock(postId);
         if (!locked) {
             console.log("⚠️ Duplicate suppressed for postId:", postId);
             return res.status(200).json({ success: false, message: "Notification already sent for this post" });
         }
 
-        // ─── Post click URL: slug ہو تو slug، ورنہ id ───
-        const postPath = postSlug
-            ? `post/${postSlug}`
-            : `details.html?id=${postId}`;
+        const postPath = postSlug ? `post/${postSlug}` : `details.html?id=${postId}`;
         const clickUrl = `${BASE_URL}/${postPath}`;
 
-        // ─── Users اکٹھے کرو ───
+        // ✅ FIX: HTML strip کرو
+        const cleanTitle    = stripHtml(title)    || 'New Post';
+        const cleanHospital = stripHtml(hospital) || 'Health Jobs';
+        const cleanBody     = stripHtml(body)     || 'Tap to view the latest healthcare update.';
+
         const userMap = await collectUserTokens(posterId);
         console.log("👥 Users to notify:", userMap.size);
 
-        if (userMap.size === 0) {
-            return res.status(200).json({ success: false, message: "No users to notify" });
-        }
+        if (userMap.size === 0) return res.status(200).json({ success: false, message: "No users to notify" });
 
-        // ─── Post entry (rate window کے لیے) ───
         const postEntry = {
             postId,
-            title:  title    || 'New Post',
-            poster: hospital || 'Health Jobs',
+            title:  cleanTitle,
+            poster: cleanHospital,
             photo:  senderPhoto || LOGO_URL,
             url:    clickUrl
         };
 
-        let totalSent   = 0;
-        let totalFailed = 0;
-        const allTokensUsed = [];
-        const allResponses  = [];
+        let totalSent = 0, totalFailed = 0;
+        const allTokensUsed = [], allResponses = [];
 
-        // ─── ہر user کے لیے rate check ───
         for (const [uid, { tokens }] of userMap) {
-
-            // Daily limit چیک
             const dailyOk = await checkAndIncrementDailyCount(uid);
-            if (!dailyOk) {
-                console.log(`⛔ Daily limit reached for uid: ${uid}`);
-                continue;
-            }
+            if (!dailyOk) { console.log(`⛔ Daily limit uid: ${uid}`); continue; }
 
-            // Rate window چیک
             const { shouldBundle, count, posts } = await checkRateWindow(uid, postEntry);
-
             let msg;
 
             if (shouldBundle) {
-                // ─── Bundled notification ───
                 const names      = [...new Set(posts.map(p => p.poster))].slice(0, 3).join(', ');
                 const bundleBody = `${count} new posts from ${names}${count > 3 ? ' & others' : ''}`;
-
                 msg = {
-                    notification: {
-                        title: `📋 ${count} New Posts on Health Jobs`,
-                        body:  bundleBody
-                    },
+                    notification: { title: `📋 ${count} New Posts on Health Jobs`, body: bundleBody },
                     webpush: {
                         notification: {
-                            icon:               LOGO_URL,
-                            badge:              LOGO_URL,
+                            icon: LOGO_URL, badge: LOGO_URL,
                             requireInteraction: false,
-                            tag:                `bundle_${uid}`,  // پرانا bundle replace ہو
-                            renotify:           true
+                            tag: `bundle_${uid}`, renotify: true
                         },
+                        // ✅ FIX: clickUrl webpush میں بھی ضرور دو
                         fcmOptions: { link: `${BASE_URL}/index.html` }
                     },
                     android: {
                         priority: 'high',
-                        notification: {
-                            icon:         'ic_notification',
-                            color:        '#0a66c2',
-                            channel_id:   'high_importance_channel',
-                            click_action: 'FLUTTER_NOTIFICATION_CLICK'
-                        }
+                        notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
                     },
-                    data: {
-                        type:    'bundle',
-                        count:   String(count),
-                        clickUrl:`${BASE_URL}/index.html`
-                    },
+                    data: { type: 'bundle', count: String(count), clickUrl: `${BASE_URL}/index.html` },
                     tokens
                 };
             } else {
-                // ─── Individual notification ───
-                const notifTitle = `${hospital || 'Health Jobs'}: ${title || 'New Medical Update'}`;
-                const notifBody  = body
-                    ? (body.length > 120 ? body.substring(0, 120) + '…' : body)
-                    : 'Tap to view the latest healthcare update.';
-
+                const notifTitle = `${cleanHospital}: ${cleanTitle}`;
+                const notifBody  = cleanBody.length > 120 ? cleanBody.substring(0, 120) + '…' : cleanBody;
                 msg = {
                     notification: { title: notifTitle, body: notifBody },
                     webpush: {
                         notification: {
-                            icon:               getIcon(senderPhoto),
-                            badge:              LOGO_URL,
+                            icon: getIcon(senderPhoto), badge: LOGO_URL,
                             requireInteraction: false,
-                            tag:                `post_${postId}`,  // same postId → replace
+                            tag: `post_${postId}`
                         },
+                        // ✅ FIX: clickUrl ضرور لگاؤ تاکہ notification clickable ہو
                         fcmOptions: { link: clickUrl }
                     },
                     android: {
                         priority: 'high',
-                        notification: {
-                            icon:         'ic_notification',
-                            color:        '#0a66c2',
-                            channel_id:   'high_importance_channel',
-                            click_action: 'FLUTTER_NOTIFICATION_CLICK'
-                        }
+                        notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
                     },
-                    data: {
-                        postId,
-                        type:    'general_post',
-                        clickUrl
-                    },
+                    data: { postId, type: 'general_post', clickUrl },
                     tokens
                 };
             }
 
             const response = await admin.messaging().sendEachForMulticast(msg);
             console.log(`✅ uid:${uid} — Sent:${response.successCount} ❌ Failed:${response.failureCount}`);
-
             totalSent   += response.successCount;
             totalFailed += response.failureCount;
-
             tokens.forEach(t => allTokensUsed.push(t));
             response.responses.forEach(r => allResponses.push(r));
         }
 
-        // ─── Invalid tokens ہٹاؤ ───
         if (allResponses.some(r => !r.success)) {
             await removeInvalidTokens(allResponses, allTokensUsed);
         }
@@ -343,14 +310,22 @@ app.post('/api/server', async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTE 2 — CHAT MESSAGE NOTIFICATION  (/api/chat)
-// جب کوئی نیا میسج بھیجے — صرف receiver کو clickable notification
+// ✅ FIX: ڈپلیکیٹ notifications روکو + HTML strip + clickable URL
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/chat', async (req, res) => {
     try {
         const { receiverUid, targetToken, senderName, senderUid, senderPhoto, messagePreview } = req.body;
         console.log("💬 Chat Notification:", { senderName, senderUid, receiverUid });
 
-        // targetToken براہ راست دیا یا receiverUid سے Firestore میں تلاش کریں
+        // ✅ FIX: 5 سیکنڈ کے اندر دوبارہ notification نہ جائے
+        if (senderUid && receiverUid) {
+            const chatLockOk = await acquireChatLock(senderUid, receiverUid);
+            if (!chatLockOk) {
+                console.log("⚠️ Chat notification duplicate suppressed");
+                return res.status(200).json({ success: false, message: "Duplicate chat notification suppressed" });
+            }
+        }
+
         let token = targetToken;
         if (!token && receiverUid) {
             const userDoc = await db.collection('users').doc(receiverUid).get();
@@ -360,48 +335,42 @@ app.post('/api/chat', async (req, res) => {
             }
         }
 
-        if (!token) {
-            return res.status(400).json({ error: "No FCM token found for receiver" });
-        }
-        if (!senderUid) {
-            return res.status(400).json({ error: "senderUid is required" });
-        }
+        if (!token)     return res.status(400).json({ error: "No FCM token found for receiver" });
+        if (!senderUid) return res.status(400).json({ error: "senderUid is required" });
 
-        // Daily limit چیک (receiverUid سے یا token hash سے)
         const limitKey = receiverUid || token.substring(0, 20);
         const dailyOk  = await checkAndIncrementDailyCount(`chat_${limitKey}`);
-        if (!dailyOk) {
-            return res.status(200).json({ success: false, message: "Daily limit reached" });
-        }
+        if (!dailyOk) return res.status(200).json({ success: false, message: "Daily limit reached" });
 
-        // کلک کرنے پر chat.html کھلے اسی sender کے ساتھ
-        const clickUrl = `${BASE_URL}/chat.html?uid=${senderUid}`;
-
-        const notifBody = messagePreview
-            ? (messagePreview.length > 80 ? messagePreview.substring(0, 80) + '…' : messagePreview)
+        // ✅ FIX: HTML strip کرو - notification body صاف ہو
+        const cleanPreview = stripHtml(messagePreview);
+        const notifBody    = cleanPreview
+            ? (cleanPreview.length > 80 ? cleanPreview.substring(0, 80) + '…' : cleanPreview)
             : 'You have a new message. Tap to reply.';
+
+        // ✅ FIX: clickUrl - notification click کرنے پر chat کھلے
+        const clickUrl = `${BASE_URL}/chat.html?uid=${senderUid}`;
 
         const message = {
             notification: {
-                title: `💬 ${senderName || 'Healthcare User'}`,
+                title: `💬 ${stripHtml(senderName) || 'Healthcare User'}`,
                 body:  notifBody
             },
             webpush: {
                 notification: {
-                    icon:               getIcon(senderPhoto),
-                    badge:              LOGO_URL,
+                    icon: getIcon(senderPhoto), badge: LOGO_URL,
                     requireInteraction: false,
-                    tag:                `chat_${senderUid}`,  // same sender → replace
-                    renotify:           true
+                    tag: `chat_${senderUid}`,   // same sender → replace (ڈپلیکیٹ نہیں)
+                    renotify: true
                 },
+                // ✅ FIX: یہ link ضرور ہونا چاہیے - notification clickable بنتی ہے
                 fcmOptions: { link: clickUrl }
             },
             android: {
                 priority: 'high',
                 notification: {
-                    icon:         'ic_notification',
-                    color:        '#0a66c2',
-                    channel_id:   'high_importance_channel',
+                    icon: 'ic_notification', color: '#0a66c2',
+                    channel_id: 'high_importance_channel',
                     click_action: 'FLUTTER_NOTIFICATION_CLICK'
                 }
             },
@@ -426,23 +395,19 @@ app.post('/api/chat', async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTE 3 — CALL NOTIFICATION  (/api/call)
+// ✅ FIX: callerPhoto اور callerName ٹھیک سے pass ہو
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/call', async (req, res) => {
     try {
         const { targetToken, callerName, callerUid, callerPhoto, callType, action } = req.body;
         console.log("📞 Call request:", { callerName, callerUid, callType, action });
 
-        if (!targetToken) {
-            return res.status(400).json({ error: "targetToken is required" });
-        }
+        if (!targetToken) return res.status(400).json({ error: "targetToken is required" });
 
         // ─── Cancel call ───
         if (action === 'cancel') {
             const msg = {
-                data: {
-                    action:    'cancel_call',
-                    callerUid: String(callerUid || '')
-                },
+                data: { action: 'cancel_call', callerUid: String(callerUid || '') },
                 android: { priority: 'high', ttl: '10s' },
                 token: targetToken
             };
@@ -452,39 +417,41 @@ app.post('/api/call', async (req, res) => {
         }
 
         // ─── Incoming call ───
-        const clickUrl   = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
-        const callEmoji  = callType === 'video' ? '🎥' : '📞';
-        const callText   = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
+        const clickUrl  = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
+        const callEmoji = callType === 'video' ? '🎥' : '📞';
+        const callText  = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
+
+        // ✅ FIX: callerName clean کرو
+        const cleanCallerName = stripHtml(callerName) || 'Health Jobs User';
 
         const msg = {
             notification: {
-                title: `${callEmoji} ${callerName || 'Health Jobs User'}`,
+                title: `${callEmoji} ${cleanCallerName}`,
                 body:  callText
             },
             webpush: {
                 notification: {
-                    icon:               getIcon(callerPhoto),
-                    badge:              LOGO_URL,
-                    requireInteraction: true,  // call dismiss نہ ہو جلدی
-                    tag:                `call_${callerUid}`
+                    icon: getIcon(callerPhoto), badge: LOGO_URL,
+                    requireInteraction: true,
+                    tag: `call_${callerUid}`
                 },
+                // ✅ FIX: click کرنے پر chat کھلے
                 fcmOptions: { link: clickUrl }
             },
             android: {
                 priority: 'high',
-                ttl:      '30s',
+                ttl: '30s',
                 notification: {
-                    icon:         'ic_notification',
-                    color:        '#0a66c2',
-                    channel_id:   'high_importance_channel',
+                    icon: 'ic_notification', color: '#0a66c2',
+                    channel_id: 'high_importance_channel',
                     click_action: 'FLUTTER_NOTIFICATION_CLICK'
                 }
             },
             data: {
                 isCall:     'true',
-                callerUid:  String(callerUid  || ''),
-                callerName: String(callerName || 'Health Jobs User'),
-                callType:   String(callType   || 'audio'),
+                callerUid:  String(callerUid   || ''),
+                callerName: cleanCallerName,
+                callType:   String(callType    || 'audio'),
                 clickUrl
             },
             token: targetToken
@@ -503,107 +470,75 @@ app.post('/api/call', async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTE 4 — LIKE / COMMENT NOTIFICATION  (/api/reaction)
-// جب کوئی like یا comment کرے — پوسٹ کے owner کو notification جائے
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/reaction', async (req, res) => {
     try {
         const {
-            type,           // 'like' | 'comment'
-            postId,
-            postSlug,
-            postTitle,
-            postOwnerId,    // جس کی پوسٹ ہے
-            actorName,      // جس نے like/comment کیا
-            actorUid,
-            actorPhoto,
-            commentPreview  // comment کا text (optional)
+            type, postId, postSlug, postTitle,
+            postOwnerId, actorName, actorUid, actorPhoto, commentPreview
         } = req.body;
 
         console.log("❤️ Reaction Notification:", { type, postId, postOwnerId, actorName });
 
-        if (!postOwnerId) {
-            return res.status(400).json({ error: "postOwnerId is required" });
-        }
-        if (!type || !['like', 'comment'].includes(type)) {
-            return res.status(400).json({ error: "type must be 'like' or 'comment'" });
-        }
+        if (!postOwnerId) return res.status(400).json({ error: "postOwnerId is required" });
+        if (!type || !['like', 'comment'].includes(type)) return res.status(400).json({ error: "type must be 'like' or 'comment'" });
+        if (actorUid && actorUid === postOwnerId) return res.status(200).json({ success: false, message: "Self-reaction suppressed" });
 
-        // خود اپنی پوسٹ پر like/comment پر notification نہ جائے
-        if (actorUid && actorUid === postOwnerId) {
-            return res.status(200).json({ success: false, message: "Self-reaction suppressed" });
-        }
-
-        // Daily limit چیک
         const dailyOk = await checkAndIncrementDailyCount(`reaction_${postOwnerId}`);
-        if (!dailyOk) {
-            return res.status(200).json({ success: false, message: "Daily limit reached" });
-        }
+        if (!dailyOk) return res.status(200).json({ success: false, message: "Daily limit reached" });
 
-        // Post owner کا FCM token
         const ownerDoc = await db.collection('users').doc(postOwnerId).get();
-        if (!ownerDoc.exists) {
-            return res.status(404).json({ error: "Post owner not found" });
-        }
+        if (!ownerDoc.exists) return res.status(404).json({ error: "Post owner not found" });
+
         const rawToken = ownerDoc.data().fcmToken;
         const token    = Array.isArray(rawToken) ? rawToken[0] : rawToken;
+        if (!token)    return res.status(200).json({ success: false, message: "Owner has no FCM token" });
 
-        if (!token) {
-            return res.status(200).json({ success: false, message: "Owner has no FCM token" });
-        }
-
-        // Post click URL
-        const postPath = postSlug
-            ? `post/${postSlug}`
-            : `details.html?id=${postId}`;
+        const postPath = postSlug ? `post/${postSlug}` : `details.html?id=${postId}`;
         const clickUrl = `${BASE_URL}/${postPath}`;
 
-        // Notification content
-        let notifTitle, notifBody;
-        const actor = actorName || 'Someone';
-        const pTitle = postTitle ? `"${postTitle}"` : 'your post';
+        // ✅ FIX: HTML strip
+        const cleanActor        = stripHtml(actorName)       || 'Someone';
+        const cleanPostTitle    = stripHtml(postTitle);
+        const cleanComment      = stripHtml(commentPreview);
+        const pTitle            = cleanPostTitle ? `"${cleanPostTitle}"` : 'your post';
 
+        let notifTitle, notifBody;
         if (type === 'like') {
-            notifTitle = `❤️ ${actor} liked your post`;
-            notifBody  = `${actor} liked ${pTitle}`;
+            notifTitle = `❤️ ${cleanActor} liked your post`;
+            notifBody  = `${cleanActor} liked ${pTitle}`;
         } else {
-            notifTitle = `💬 ${actor} commented on your post`;
-            notifBody  = commentPreview
-                ? `${actor}: ${commentPreview.length > 80 ? commentPreview.substring(0, 80) + '…' : commentPreview}`
-                : `${actor} commented on ${pTitle}`;
+            notifTitle = `💬 ${cleanActor} commented on your post`;
+            notifBody  = cleanComment
+                ? `${cleanActor}: ${cleanComment.length > 80 ? cleanComment.substring(0, 80) + '…' : cleanComment}`
+                : `${cleanActor} commented on ${pTitle}`;
         }
 
         const message = {
             notification: { title: notifTitle, body: notifBody },
             webpush: {
                 notification: {
-                    icon:               getIcon(actorPhoto),
-                    badge:              LOGO_URL,
+                    icon: getIcon(actorPhoto), badge: LOGO_URL,
                     requireInteraction: false,
-                    tag:                `${type}_${postId}_${actorUid || Date.now()}`,
-                    renotify:           true
+                    tag: `${type}_${postId}_${actorUid || Date.now()}`,
+                    renotify: true
                 },
                 fcmOptions: { link: clickUrl }
             },
             android: {
                 priority: 'normal',
                 notification: {
-                    icon:         'ic_notification',
-                    color:        '#e91e63',
-                    channel_id:   'high_importance_channel',
+                    icon: 'ic_notification', color: '#e91e63',
+                    channel_id: 'high_importance_channel',
                     click_action: 'FLUTTER_NOTIFICATION_CLICK'
                 }
             },
-            data: {
-                type:     `reaction_${type}`,
-                postId:   String(postId || ''),
-                actorUid: String(actorUid || ''),
-                clickUrl
-            },
+            data: { type: `reaction_${type}`, postId: String(postId || ''), actorUid: String(actorUid || ''), clickUrl },
             token
         };
 
         const r = await admin.messaging().send(message);
-        console.log(`✅ ${type} notification sent to owner:`, postOwnerId, r);
+        console.log(`✅ ${type} notification sent:`, postOwnerId, r);
         return res.status(200).json({ success: true, type });
 
     } catch (error) {
@@ -620,9 +555,7 @@ app.post('/api', async (req, res) => {
     const { targetToken, callerName, callerUid, callerPhoto, callType, action } = req.body;
     console.log("📞 /api call (legacy route):", { callerName, action });
 
-    if (!targetToken) {
-        return res.status(400).json({ error: "targetToken is required" });
-    }
+    if (!targetToken) return res.status(400).json({ error: "targetToken is required" });
 
     if (action === 'cancel') {
         try {
@@ -639,37 +572,22 @@ app.post('/api', async (req, res) => {
     }
 
     try {
-        const clickUrl  = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
-        const callEmoji = callType === 'video' ? '🎥' : '📞';
-        const callText  = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
+        const cleanCallerName = stripHtml(callerName) || 'Health Jobs User';
+        const clickUrl        = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
+        const callEmoji       = callType === 'video' ? '🎥' : '📞';
+        const callText        = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
 
         const msg = {
-            notification: {
-                title: `${callEmoji} ${callerName || 'Health Jobs User'}`,
-                body:  callText
-            },
+            notification: { title: `${callEmoji} ${cleanCallerName}`, body: callText },
             webpush: {
-                notification: {
-                    icon:               getIcon(callerPhoto),
-                    badge:              LOGO_URL,
-                    requireInteraction: true
-                },
+                notification: { icon: getIcon(callerPhoto), badge: LOGO_URL, requireInteraction: true },
                 fcmOptions: { link: clickUrl }
             },
             android: {
-                priority: 'high',
-                ttl:      '30s',
-                notification: {
-                    channel_id:   'high_importance_channel',
-                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
-                }
+                priority: 'high', ttl: '30s',
+                notification: { channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
             },
-            data: {
-                isCall:     'true',
-                callerUid:  String(callerUid  || ''),
-                callerName: String(callerName || 'Health Jobs User'),
-                callType:   String(callType   || 'audio')
-            },
+            data: { isCall: 'true', callerUid: String(callerUid || ''), callerName: cleanCallerName, callType: String(callType || 'audio') },
             token: targetToken
         };
         await admin.messaging().send(msg);
