@@ -34,7 +34,6 @@ app.get('/api/server', (req, res) => res.send("✅ API is Live!"));
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER: HTML tags اور entities صاف کرو - plain text بناؤ
-// ✅ FIX: notification body میں &nbsp;<p>...</p> آنے کا مسئلہ حل
 // ══════════════════════════════════════════════════════════════════════════
 function stripHtml(str) {
     if (!str) return '';
@@ -46,6 +45,7 @@ function stripHtml(str) {
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'")
+        .replace(/[^\w\s.,!?@#$%^&*()\-+=~/\\\[\]{}|;:'"`]/g, '') // ایموجیز اور دیگر خاص حروف ہٹائیں
         .replace(/\s+/g, ' ')            // multiple spaces → single
         .trim();
 }
@@ -80,7 +80,6 @@ async function checkAndIncrementDailyCount(uid) {
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER: post notification deduplication
-// ✅ FIX: ایک postId کا notification صرف ایک بار جائے
 // ══════════════════════════════════════════════════════════════════════════
 async function acquirePostLock(postId) {
     const ref = db.collection('notif_sent_posts').doc(String(postId));
@@ -100,18 +99,15 @@ async function acquirePostLock(postId) {
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER: chat notification deduplication
-// ✅ FIX: ایک ہی chat message کا notification بار بار نہ جائے
-// ──────────────────────────────────────────────────────────────────────────
-// chatId = `${senderUid}_${receiverUid}_${timestamp_rounded_to_5s}`
 // ══════════════════════════════════════════════════════════════════════════
 async function acquireChatLock(senderUid, receiverUid) {
-    const window5s = Math.floor(Date.now() / 5000);  // 5 سیکنڈ کی window
+    const window5s = Math.floor(Date.now() / 5000);
     const lockKey  = `chat_${senderUid}_${receiverUid}_${window5s}`;
     const ref      = db.collection('notif_chat_locks').doc(lockKey);
     try {
         const result = await db.runTransaction(async (tx) => {
             const snap = await tx.get(ref);
-            if (snap.exists) return false;  // پہلے 5 سیکنڈ میں بھیج چکے
+            if (snap.exists) return false;
             tx.set(ref, { sentAt: Date.now() });
             return true;
         });
@@ -205,7 +201,6 @@ app.post('/api/server', async (req, res) => {
 
         if (!postId) return res.status(400).json({ success: false, message: "postId is required" });
 
-        // ✅ FIX: ایک postId کا notification صرف ایک بار
         const locked = await acquirePostLock(postId);
         if (!locked) {
             console.log("⚠️ Duplicate suppressed for postId:", postId);
@@ -215,7 +210,6 @@ app.post('/api/server', async (req, res) => {
         const postPath = postSlug ? `post/${postSlug}` : `details.html?id=${postId}`;
         const clickUrl = `${BASE_URL}/${postPath}`;
 
-        // ✅ FIX: HTML strip کرو
         const cleanTitle    = stripHtml(title)    || 'New Post';
         const cleanHospital = stripHtml(hospital) || 'Health Jobs';
         const cleanBody     = stripHtml(body)     || 'Tap to view the latest healthcare update.';
@@ -247,48 +241,73 @@ app.post('/api/server', async (req, res) => {
                 const names      = [...new Set(posts.map(p => p.poster))].slice(0, 3).join(', ');
                 const bundleBody = `${count} new posts from ${names}${count > 3 ? ' & others' : ''}`;
                 msg = {
-                    notification: { title: `📋 ${count} New Posts on Health Jobs`, body: bundleBody },
+                    notification: {
+                        title: `${count} New Posts on Health Jobs`,
+                        body: bundleBody
+                    },
                     webpush: {
                         notification: {
-                            icon: LOGO_URL, badge: LOGO_URL,
+                            icon: LOGO_URL,
+                            badge: LOGO_URL,
                             requireInteraction: false,
-                            tag: `bundle_${uid}`, renotify: true
+                            tag: `bundle_${uid}`,
+                            renotify: true
                         },
-                        // ✅ FIX: clickUrl webpush میں بھی ضرور دو
                         fcmOptions: { link: `${BASE_URL}/index.html` }
                     },
                     android: {
                         priority: 'high',
-                        notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                        notification: {
+                            icon: 'ic_notification',
+                            color: '#0a66c2',
+                            channel_id: 'high_importance_channel',
+                            click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                        }
                     },
-                    data: { type: 'bundle', count: String(count), clickUrl: `${BASE_URL}/index.html` },
+                    data: {
+                        type: 'bundle',
+                        count: String(count),
+                        clickUrl: `${BASE_URL}/index.html`
+                    },
                     tokens
                 };
             } else {
                 const notifTitle = `${cleanHospital}: ${cleanTitle}`;
-                const notifBody  = cleanBody.length > 120 ? cleanBody.substring(0, 120) + '…' : cleanBody;
+                const notifBody  = cleanBody.length > 120 ? cleanBody.substring(0, 120) + '...' : cleanBody;
                 msg = {
-                    notification: { title: notifTitle, body: notifBody },
+                    notification: {
+                        title: notifTitle,
+                        body: notifBody
+                    },
                     webpush: {
                         notification: {
-                            icon: getIcon(senderPhoto), badge: LOGO_URL,
+                            icon: getIcon(senderPhoto),
+                            badge: LOGO_URL,
                             requireInteraction: false,
                             tag: `post_${postId}`
                         },
-                        // ✅ FIX: clickUrl ضرور لگاؤ تاکہ notification clickable ہو
                         fcmOptions: { link: clickUrl }
                     },
                     android: {
                         priority: 'high',
-                        notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                        notification: {
+                            icon: 'ic_notification',
+                            color: '#0a66c2',
+                            channel_id: 'high_importance_channel',
+                            click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                        }
                     },
-                    data: { postId, type: 'general_post', clickUrl },
+                    data: {
+                        postId,
+                        type: 'general_post',
+                        clickUrl
+                    },
                     tokens
                 };
             }
 
             const response = await admin.messaging().sendEachForMulticast(msg);
-            console.log(`✅ uid:${uid} — Sent:${response.successCount} ❌ Failed:${response.failureCount}`);
+            console.log(`✅ uid:${uid} — Sent:${response.successCount} Failed:${response.failureCount}`);
             totalSent   += response.successCount;
             totalFailed += response.failureCount;
             tokens.forEach(t => allTokensUsed.push(t));
@@ -310,14 +329,12 @@ app.post('/api/server', async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTE 2 — CHAT MESSAGE NOTIFICATION  (/api/chat)
-// ✅ FIX: ڈپلیکیٹ notifications روکو + HTML strip + clickable URL
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/chat', async (req, res) => {
     try {
         const { receiverUid, targetToken, senderName, senderUid, senderPhoto, messagePreview } = req.body;
         console.log("💬 Chat Notification:", { senderName, senderUid, receiverUid });
 
-        // ✅ FIX: 5 سیکنڈ کے اندر دوبارہ notification نہ جائے
         if (senderUid && receiverUid) {
             const chatLockOk = await acquireChatLock(senderUid, receiverUid);
             if (!chatLockOk) {
@@ -342,34 +359,33 @@ app.post('/api/chat', async (req, res) => {
         const dailyOk  = await checkAndIncrementDailyCount(`chat_${limitKey}`);
         if (!dailyOk) return res.status(200).json({ success: false, message: "Daily limit reached" });
 
-        // ✅ FIX: HTML strip کرو - notification body صاف ہو
         const cleanPreview = stripHtml(messagePreview);
         const notifBody    = cleanPreview
-            ? (cleanPreview.length > 80 ? cleanPreview.substring(0, 80) + '…' : cleanPreview)
+            ? (cleanPreview.length > 80 ? cleanPreview.substring(0, 80) + '...' : cleanPreview)
             : 'You have a new message. Tap to reply.';
 
-        // ✅ FIX: clickUrl - notification click کرنے پر chat کھلے
         const clickUrl = `${BASE_URL}/chat.html?uid=${senderUid}`;
 
         const message = {
             notification: {
-                title: `💬 ${stripHtml(senderName) || 'Healthcare User'}`,
+                title: stripHtml(senderName) || 'Healthcare User',
                 body:  notifBody
             },
             webpush: {
                 notification: {
-                    icon: getIcon(senderPhoto), badge: LOGO_URL,
+                    icon: getIcon(senderPhoto),
+                    badge: LOGO_URL,
                     requireInteraction: false,
-                    tag: `chat_${senderUid}`,   // same sender → replace (ڈپلیکیٹ نہیں)
+                    tag: `chat_${senderUid}`,
                     renotify: true
                 },
-                // ✅ FIX: یہ link ضرور ہونا چاہیے - notification clickable بنتی ہے
                 fcmOptions: { link: clickUrl }
             },
             android: {
                 priority: 'high',
                 notification: {
-                    icon: 'ic_notification', color: '#0a66c2',
+                    icon: 'ic_notification',
+                    color: '#0a66c2',
                     channel_id: 'high_importance_channel',
                     click_action: 'FLUTTER_NOTIFICATION_CLICK'
                 }
@@ -395,7 +411,6 @@ app.post('/api/chat', async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTE 3 — CALL NOTIFICATION  (/api/call)
-// ✅ FIX: callerPhoto اور callerName ٹھیک سے pass ہو
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/call', async (req, res) => {
     try {
@@ -407,8 +422,14 @@ app.post('/api/call', async (req, res) => {
         // ─── Cancel call ───
         if (action === 'cancel') {
             const msg = {
-                data: { action: 'cancel_call', callerUid: String(callerUid || '') },
-                android: { priority: 'high', ttl: '10s' },
+                data: {
+                    action: 'cancel_call',
+                    callerUid: String(callerUid || '')
+                },
+                android: {
+                    priority: 'high',
+                    ttl: 10000 // 10 سیکنڈ (milliseconds میں)
+                },
                 token: targetToken
             };
             const r = await admin.messaging().send(msg);
@@ -418,31 +439,29 @@ app.post('/api/call', async (req, res) => {
 
         // ─── Incoming call ───
         const clickUrl  = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
-        const callEmoji = callType === 'video' ? '🎥' : '📞';
         const callText  = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
-
-        // ✅ FIX: callerName clean کرو
         const cleanCallerName = stripHtml(callerName) || 'Health Jobs User';
 
         const msg = {
             notification: {
-                title: `${callEmoji} ${cleanCallerName}`,
+                title: `${cleanCallerName}`,
                 body:  callText
             },
             webpush: {
                 notification: {
-                    icon: getIcon(callerPhoto), badge: LOGO_URL,
+                    icon: getIcon(callerPhoto),
+                    badge: LOGO_URL,
                     requireInteraction: true,
                     tag: `call_${callerUid}`
                 },
-                // ✅ FIX: click کرنے پر chat کھلے
                 fcmOptions: { link: clickUrl }
             },
             android: {
                 priority: 'high',
-                ttl: '30s',
+                ttl: 30000, // 30 سیکنڈ (milliseconds میں)
                 notification: {
-                    icon: 'ic_notification', color: '#0a66c2',
+                    icon: 'ic_notification',
+                    color: '#0a66c2',
                     channel_id: 'high_importance_channel',
                     click_action: 'FLUTTER_NOTIFICATION_CLICK'
                 }
@@ -497,7 +516,6 @@ app.post('/api/reaction', async (req, res) => {
         const postPath = postSlug ? `post/${postSlug}` : `details.html?id=${postId}`;
         const clickUrl = `${BASE_URL}/${postPath}`;
 
-        // ✅ FIX: HTML strip
         const cleanActor        = stripHtml(actorName)       || 'Someone';
         const cleanPostTitle    = stripHtml(postTitle);
         const cleanComment      = stripHtml(commentPreview);
@@ -505,20 +523,24 @@ app.post('/api/reaction', async (req, res) => {
 
         let notifTitle, notifBody;
         if (type === 'like') {
-            notifTitle = `❤️ ${cleanActor} liked your post`;
+            notifTitle = `${cleanActor} liked your post`;
             notifBody  = `${cleanActor} liked ${pTitle}`;
         } else {
-            notifTitle = `💬 ${cleanActor} commented on your post`;
+            notifTitle = `${cleanActor} commented on your post`;
             notifBody  = cleanComment
-                ? `${cleanActor}: ${cleanComment.length > 80 ? cleanComment.substring(0, 80) + '…' : cleanComment}`
+                ? `${cleanActor}: ${cleanComment.length > 80 ? cleanComment.substring(0, 80) + '...' : cleanComment}`
                 : `${cleanActor} commented on ${pTitle}`;
         }
 
         const message = {
-            notification: { title: notifTitle, body: notifBody },
+            notification: {
+                title: notifTitle,
+                body: notifBody
+            },
             webpush: {
                 notification: {
-                    icon: getIcon(actorPhoto), badge: LOGO_URL,
+                    icon: getIcon(actorPhoto),
+                    badge: LOGO_URL,
                     requireInteraction: false,
                     tag: `${type}_${postId}_${actorUid || Date.now()}`,
                     renotify: true
@@ -528,12 +550,18 @@ app.post('/api/reaction', async (req, res) => {
             android: {
                 priority: 'normal',
                 notification: {
-                    icon: 'ic_notification', color: '#e91e63',
+                    icon: 'ic_notification',
+                    color: '#e91e63',
                     channel_id: 'high_importance_channel',
                     click_action: 'FLUTTER_NOTIFICATION_CLICK'
                 }
             },
-            data: { type: `reaction_${type}`, postId: String(postId || ''), actorUid: String(actorUid || ''), clickUrl },
+            data: {
+                type: `reaction_${type}`,
+                postId: String(postId || ''),
+                actorUid: String(actorUid || ''),
+                clickUrl
+            },
             token
         };
 
@@ -560,8 +588,14 @@ app.post('/api', async (req, res) => {
     if (action === 'cancel') {
         try {
             const msg = {
-                data: { action: 'cancel_call', callerUid: String(callerUid || '') },
-                android: { priority: 'high', ttl: '10s' },
+                data: {
+                    action: 'cancel_call',
+                    callerUid: String(callerUid || '')
+                },
+                android: {
+                    priority: 'high',
+                    ttl: 10000 // 10 سیکنڈ (milliseconds میں)
+                },
                 token: targetToken
             };
             await admin.messaging().send(msg);
@@ -574,20 +608,35 @@ app.post('/api', async (req, res) => {
     try {
         const cleanCallerName = stripHtml(callerName) || 'Health Jobs User';
         const clickUrl        = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
-        const callEmoji       = callType === 'video' ? '🎥' : '📞';
         const callText        = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
 
         const msg = {
-            notification: { title: `${callEmoji} ${cleanCallerName}`, body: callText },
+            notification: {
+                title: cleanCallerName,
+                body: callText
+            },
             webpush: {
-                notification: { icon: getIcon(callerPhoto), badge: LOGO_URL, requireInteraction: true },
+                notification: {
+                    icon: getIcon(callerPhoto),
+                    badge: LOGO_URL,
+                    requireInteraction: true
+                },
                 fcmOptions: { link: clickUrl }
             },
             android: {
-                priority: 'high', ttl: '30s',
-                notification: { channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                priority: 'high',
+                ttl: 30000, // 30 سیکنڈ (milliseconds میں)
+                notification: {
+                    channel_id: 'high_importance_channel',
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                }
             },
-            data: { isCall: 'true', callerUid: String(callerUid || ''), callerName: cleanCallerName, callType: String(callType || 'audio') },
+            data: {
+                isCall: 'true',
+                callerUid: String(callerUid || ''),
+                callerName: cleanCallerName,
+                callType: String(callType || 'audio')
+            },
             token: targetToken
         };
         await admin.messaging().send(msg);
