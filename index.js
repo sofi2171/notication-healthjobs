@@ -24,7 +24,7 @@ app.use(express.json());
 const BASE_URL       = 'https://healthjobs-portal.web.app';
 const LOGO_URL       = `${BASE_URL}/images/logo.png`;
 const RATE_WINDOW_MS = 10 * 60 * 1000;
-const RATE_LIMIT     = 5;
+const RATE_LIMIT     = 3;   // 3 سے زیادہ ہوں تو bundle بنے
 const DAILY_MAX      = 10;
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -258,12 +258,12 @@ app.post('/api/server', async (req, res) => {
                 // ─── Bundle: زیادہ posts ─────────────────────────────────
                 // tag: `bundle_${uid}` → ہر user کا اپنا bundle tag
                 // browser grouped notification دکھائے گا
-                const names    = [...new Set(posts.map(p => p.poster))].slice(0, 3).join(', ');
+                const names    = [...new Set(posts.map(p => p.poster))].slice(0, 2).join(', ');
                 const bundleUrl = `${BASE_URL}/index.html`;
                 msg = {
                     notification: {
-                        title: `${count} New Posts`,
-                        body:  `${names}${count > 3 ? ' & others' : ''} نے نئی پوسٹ کی`
+                        title: `${count} New Posts on Health Jobs Portal`,
+                        body:  `${names}${count > 2 ? ` & ${count - 2} others` : ''} posted new jobs`
                     },
                     webpush: {
                         notification: {
@@ -334,6 +334,7 @@ app.post('/api/server', async (req, res) => {
                     data: {
                         type:     'general_post',
                         postId:   String(postId),
+                        postSlug: String(postSlug || postId),
                         clickUrl: clickUrl
                     },
                     tokens
@@ -389,7 +390,7 @@ app.post('/api/chat', async (req, res) => {
         const cleanSender  = stripHtml(senderName) || 'Healthcare User';
         const notifBody    = cleanPreview
             ? (cleanPreview.length > 80 ? cleanPreview.substring(0, 80) + '...' : cleanPreview)
-            : 'آپ کو نیا پیغام ملا ہے۔ جواب دینے کیلئے tap کریں۔';
+            : 'You have a new message. Tap to reply.';
         const clickUrl = `${BASE_URL}/chat.html?uid=${senderUid}`;
 
         const message = {
@@ -531,10 +532,10 @@ app.post('/api/reaction', async (req, res) => {
 
         let notifTitle, notifBody;
         if (type === 'like') {
-            notifTitle = `${cleanActor} نے آپ کی پوسٹ like کی`;
-            notifBody  = `${cleanActor} liked ${pTitle}`;
+            notifTitle = `${cleanActor} liked your post`;
+            notifBody  = cleanTitle ? `${cleanActor} liked "${cleanTitle}"` : `${cleanActor} liked your post`;
         } else {
-            notifTitle = `${cleanActor} نے comment کیا`;
+            notifTitle = `${cleanActor} commented on your post`;
             notifBody  = cleanCmnt
                 ? `${cleanActor}: ${cleanCmnt.length > 80 ? cleanCmnt.substring(0, 80) + '...' : cleanCmnt}`
                 : `${cleanActor} commented on ${pTitle}`;
