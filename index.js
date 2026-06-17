@@ -43,8 +43,6 @@ const LIKE_COOLDOWN_MS   = 6 * 60 * 60 * 1000;
 const reactionGroupCache = new Map();
 const REACTION_GROUP_MS  = 30 * 1000;
 
-const reactionGroupCache = new Map();
-const REACTION_GROUP_MS  = 30 * 1000;  // 30 seconds mein aai reactions group hon
 
 setInterval(() => {
     const now = Date.now();
