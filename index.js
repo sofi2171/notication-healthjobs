@@ -30,10 +30,21 @@ const DAILY_MAX      = 10;
 // ══════════════════════════════════════════════════════════════════════════
 // IN-MEMORY CACHE
 // ══════════════════════════════════════════════════════════════════════════
-const dailyCountCache = new Map();
-const rateWindowCache = new Map();
-const chatLockCache   = new Map();
-const postSentCache   = new Set();
+const dailyCountCache    = new Map();
+const rateWindowCache    = new Map();
+const chatLockCache      = new Map();
+const postSentCache      = new Set();
+
+// Like cooldown — 6 hours tak dobara like notification nahi jayegi
+const likeCooldownCache  = new Map();
+const LIKE_COOLDOWN_MS   = 6 * 60 * 60 * 1000;
+
+// Reaction grouping — 30s window mein aai reactions ek bundle mein
+const reactionGroupCache = new Map();
+const REACTION_GROUP_MS  = 30 * 1000;
+
+const reactionGroupCache = new Map();
+const REACTION_GROUP_MS  = 30 * 1000;  // 30 seconds mein aai reactions group hon
 
 setInterval(() => {
     const now = Date.now();
@@ -46,6 +57,12 @@ setInterval(() => {
         if (now - ts > 10000) chatLockCache.delete(key);
     }
     if (postSentCache.size > 1000) postSentCache.clear();
+
+    // Like cooldown cache clean — 6+ ghante purane entries hataao
+    const now2 = Date.now();
+    for (const [key, ts] of likeCooldownCache) {
+        if (now2 - ts > LIKE_COOLDOWN_MS) likeCooldownCache.delete(key);
+    }
     console.log(`Cache: Daily:${dailyCountCache.size} Rate:${rateWindowCache.size} Chat:${chatLockCache.size} Posts:${postSentCache.size}`);
 }, 5 * 60 * 1000);
 
@@ -507,51 +524,55 @@ app.post('/api/call', async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTE 4 — LIKE / COMMENT NOTIFICATION  (/api/reaction)
 // ══════════════════════════════════════════════════════════════════════════
-app.post('/api/reaction', async (req, res) => {
-    try {
-        const { type, postId, postSlug, postTitle, postOwnerId, actorName, actorUid, actorPhoto, commentPreview } = req.body;
-        console.log("Reaction:", { type, postOwnerId, actorUid });
+// HELPER: Send grouped or single reaction notification
+async function sendReactionNotification(postOwnerId, token, group, clickUrl) {
+    const count = group.posts.length;
+    const actors = [...new Set(group.posts.map(p => p.actor))];
+    const types  = [...new Set(group.posts.map(p => p.type))];
 
-        if (!postOwnerId) return res.status(400).json({ error: "postOwnerId required" });
-        if (!type || !['like', 'comment'].includes(type)) return res.status(400).json({ error: "type must be like/comment" });
-        if (actorUid && actorUid === postOwnerId) return res.status(200).json({ success: false, message: "Self-reaction" });
+    let title, body, icon;
 
-        if (!checkDailyLimit(`reaction_${postOwnerId}`)) {
-            return res.status(200).json({ success: false, message: "Daily limit" });
-        }
-
-        const token = await getUserToken(postOwnerId);
-        if (!token) return res.status(200).json({ success: false, message: "No token" });
-
-        const postPath   = postSlug ? `post/${postSlug}` : `details.html?id=${postId}`;
-        const clickUrl   = `${BASE_URL}/${postPath}`;
-        const cleanActor = stripHtml(actorName) || 'Someone';
-        const cleanTitle = stripHtml(postTitle);
-        const cleanCmnt  = stripHtml(commentPreview);
-        const pTitle     = cleanTitle ? `"${cleanTitle}"` : 'your post';
-
-        let notifTitle, notifBody;
-        if (type === 'like') {
-            notifTitle = `${cleanActor} liked your post`;
-            notifBody  = cleanTitle ? `${cleanActor} liked "${cleanTitle}"` : `${cleanActor} liked your post`;
+    if (count === 1) {
+        const p = group.posts[0];
+        icon = p.actorPhoto;
+        if (p.type === 'like') {
+            title = `${p.actor} liked your post`;
+            body  = p.postTitle ? `${p.actor} liked "${p.postTitle}"` : `${p.actor} liked your post`;
         } else {
-            notifTitle = `${cleanActor} commented on your post`;
-            notifBody  = cleanCmnt
-                ? `${cleanActor}: ${cleanCmnt.length > 80 ? cleanCmnt.substring(0, 80) + '...' : cleanCmnt}`
-                : `${cleanActor} commented on ${pTitle}`;
+            title = `${p.actor} commented on your post`;
+            body  = p.comment
+                ? `${p.actor}: ${p.comment.length > 80 ? p.comment.substring(0,80)+'...' : p.comment}`
+                : `${p.actor} commented on your post`;
         }
+    } else {
+        // Grouped: multiple reactions in 30s window
+        icon = group.posts[0].actorPhoto;
+        const actorList = actors.slice(0,2).join(', ') + (actors.length > 2 ? ` & ${actors.length-2} others` : '');
+        const hasLike    = types.includes('like');
+        const hasComment = types.includes('comment');
+        if (hasLike && hasComment) {
+            title = `${count} interactions on your post`;
+            body  = `${actorList} liked and commented on your post`;
+        } else if (hasLike) {
+            title = `${count} people liked your post`;
+            body  = `${actorList} liked your post`;
+        } else {
+            title = `${count} comments on your post`;
+            body  = `${actorList} commented on your post`;
+        }
+    }
 
+    try {
         await admin.messaging().send({
-            notification: { title: notifTitle, body: notifBody },
+            notification: { title, body },
             webpush: {
                 notification: {
-                    icon:               getIcon(actorPhoto),
+                    icon:               getIcon(icon),
                     badge:              LOGO_URL,
                     requireInteraction: false,
-                    tag:                `${type}_${postId}_${actorUid || Date.now()}`,
+                    tag:                `reaction_${postOwnerId}`,
                     renotify:           true
                 },
-                // ✅ CLICK → post پر جاؤ
                 fcmOptions: { link: clickUrl },
                 headers:    { Urgency: 'normal' }
             },
@@ -565,16 +586,90 @@ app.post('/api/reaction', async (req, res) => {
                 }
             },
             data: {
-                type:     `reaction_${type}`,
-                postId:   String(postId || ''),
-                actorUid: String(actorUid || ''),
+                type:     'reaction_group',
+                count:    String(count),
                 clickUrl: clickUrl
             },
             token
         });
+        console.log(`Reaction sent: ${count} item(s) to ${postOwnerId}`);
+    } catch(e) {
+        console.error("Reaction send error:", e.message);
+    }
+}
 
-        console.log(`${type} notification sent`);
-        return res.status(200).json({ success: true, type });
+app.post('/api/reaction', async (req, res) => {
+    try {
+        const { type, postId, postSlug, postTitle, postOwnerId, actorName, actorUid, actorPhoto, commentPreview } = req.body;
+        console.log("Reaction:", { type, postOwnerId, actorUid });
+
+        if (!postOwnerId) return res.status(400).json({ error: "postOwnerId required" });
+        if (!type || !['like', 'comment'].includes(type)) return res.status(400).json({ error: "type must be like/comment" });
+        if (actorUid && actorUid === postOwnerId) return res.status(200).json({ success: false, message: "Self-reaction" });
+
+        // ── LIKE COOLDOWN CHECK ─────────────────────────────────────────────
+        // ایک ہی actor کا ایک ہی post پر 6 گھنٹے میں صرف ایک notification
+        if (type === 'like' && actorUid && postId) {
+            const cooldownKey = `like_${actorUid}_${postId}`;
+            const lastSent    = likeCooldownCache.get(cooldownKey);
+            if (lastSent && (Date.now() - lastSent) < LIKE_COOLDOWN_MS) {
+                console.log(`Like cooldown active: ${cooldownKey}`);
+                return res.status(200).json({ success: false, message: "Like cooldown" });
+            }
+            likeCooldownCache.set(cooldownKey, Date.now());
+        }
+
+        if (!checkDailyLimit(`reaction_${postOwnerId}`)) {
+            return res.status(200).json({ success: false, message: "Daily limit" });
+        }
+
+        const token = await getUserToken(postOwnerId);
+        if (!token) return res.status(200).json({ success: false, message: "No token" });
+
+        const postPath    = postSlug ? `updates/${postSlug}` : `jobs/${postId}`;
+        const clickUrl    = `${BASE_URL}/${postPath}`;
+        const cleanActor  = stripHtml(actorName) || 'Someone';
+        const cleanTitle  = stripHtml(postTitle)  || '';
+        const cleanCmnt   = stripHtml(commentPreview) || '';
+
+        const reactionEntry = {
+            type,
+            actor:       cleanActor,
+            actorPhoto:  actorPhoto || '',
+            postTitle:   cleanTitle,
+            comment:     cleanCmnt,
+            postId:      postId || '',
+            postSlug:    postSlug || ''
+        };
+
+        // ── REACTION GROUPING ───────────────────────────────────────────────
+        // 30 سیکنڈ کی window میں آئی reactions ایک grouped notification بنائیں
+        const existing = reactionGroupCache.get(postOwnerId);
+
+        if (existing) {
+            // window active ہے — entry add کرو، timer reset کرو
+            clearTimeout(existing.timer);
+            existing.posts.push(reactionEntry);
+
+            existing.timer = setTimeout(async () => {
+                reactionGroupCache.delete(postOwnerId);
+                await sendReactionNotification(postOwnerId, token, existing, clickUrl);
+            }, REACTION_GROUP_MS);
+
+            reactionGroupCache.set(postOwnerId, existing);
+            return res.status(200).json({ success: true, queued: true, count: existing.posts.length });
+        } else {
+            // نئی window شروع کرو
+            const group = {
+                posts: [reactionEntry],
+                timer: setTimeout(async () => {
+                    reactionGroupCache.delete(postOwnerId);
+                    await sendReactionNotification(postOwnerId, token, group, clickUrl);
+                }, REACTION_GROUP_MS)
+            };
+            reactionGroupCache.set(postOwnerId, group);
+            return res.status(200).json({ success: true, queued: true, count: 1 });
+        }
 
     } catch (error) {
         console.error("Reaction Error:", error.message);
