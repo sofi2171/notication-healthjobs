@@ -23,55 +23,36 @@ app.use(express.json());
 // ─── Constants ────────────────────────────────────────────────────────────
 const BASE_URL       = 'https://healthjobs-portal.web.app';
 const LOGO_URL       = `${BASE_URL}/images/logo.png`;
-const RATE_WINDOW_MS = 10 * 60 * 1000;  // 10 منٹ
+const RATE_WINDOW_MS = 10 * 60 * 1000;
 const RATE_LIMIT     = 5;
 const DAILY_MAX      = 10;
 
 // ══════════════════════════════════════════════════════════════════════════
-// IN-MEMORY CACHE — Firestore costs بچانے کیلئے
+// IN-MEMORY CACHE
 // ══════════════════════════════════════════════════════════════════════════
-// NOTE: Vercel/serverless میں یہ cache request کے درمیان survive نہیں کرے گا
-// اگر آپ کو exact limits چاہیے تو Redis use کریں، ورنہ یہ acceptable ہے
-// کیونکہ FCM خود بھی rate limit کرتا ہے
+const dailyCountCache = new Map();
+const rateWindowCache = new Map();
+const chatLockCache   = new Map();
+const postSentCache   = new Set();
 
-const dailyCountCache = new Map();    // key: `${uid}_${date}` → count
-const rateWindowCache = new Map();    // key: uid → [{ts, ...}]
-const chatLockCache   = new Map();    // key: lockKey → timestamp
-const postSentCache   = new Set();    // postIds جو بھیجے جا چکے
-
-// ─── Periodic cache cleanup ────────────────────────────────────────────────
 setInterval(() => {
     const now = Date.now();
-    
-    // Rate window cache clean
     for (const [key, entries] of rateWindowCache) {
         const filtered = entries.filter(e => e.ts > now - RATE_WINDOW_MS);
-        if (filtered.length === 0) {
-            rateWindowCache.delete(key);
-        } else {
-            rateWindowCache.set(key, filtered);
-        }
+        if (filtered.length === 0) rateWindowCache.delete(key);
+        else rateWindowCache.set(key, filtered);
     }
-    
-    // Chat lock cache clean (5s سے پرانے delete)
     for (const [key, ts] of chatLockCache) {
         if (now - ts > 10000) chatLockCache.delete(key);
     }
-    
-    // Post sent cache clean (1 گھنٹے سے پرانے delete)
-    // postSentCache کو size limit کیلئے clean کرتے ہیں
-    if (postSentCache.size > 1000) {
-        postSentCache.clear();
-    }
-    
-    console.log(`Cache stats - Daily:${dailyCountCache.size}, Rate:${rateWindowCache.size}, Chat:${chatLockCache.size}, Posts:${postSentCache.size}`);
-}, 5 * 60 * 1000); // ہر 5 منٹ بعد
+    if (postSentCache.size > 1000) postSentCache.clear();
+    console.log(`Cache: Daily:${dailyCountCache.size} Rate:${rateWindowCache.size} Chat:${chatLockCache.size} Posts:${postSentCache.size}`);
+}, 5 * 60 * 1000);
 
-// Midnight cache reset for daily counts
 setInterval(() => {
     dailyCountCache.clear();
-    console.log("Daily count cache reset at midnight");
-}, 60 * 60 * 1000); // ہر گھنٹے چیک (effective midnight reset approximate)
+    console.log("Daily count cache reset");
+}, 60 * 60 * 1000);
 
 // ─── Health Check ──────────────────────────────────────────────────────────
 app.get('/',           (req, res) => res.send("✅ Health Jobs API is Live!"));
@@ -79,7 +60,7 @@ app.get('/api/server', (req, res) => res.send("✅ API is Live!"));
 
 
 // ══════════════════════════════════════════════════════════════════════════
-// HELPER: HTML tags، entities اور ایموجیز صاف کرو
+// HELPER: HTML اور ایموجی صاف کرو
 // ══════════════════════════════════════════════════════════════════════════
 function stripHtml(str) {
     if (!str) return '';
@@ -111,14 +92,14 @@ function stripHtml(str) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// HELPER: valid icon URL یا logo fallback
+// HELPER: Valid icon یا logo
 // ══════════════════════════════════════════════════════════════════════════
 function getIcon(photo) {
     return photo && photo.startsWith('http') ? photo : LOGO_URL;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// HELPER: In-memory daily count (Firestore transaction کی بجائے)
+// HELPER: Daily limit check
 // ══════════════════════════════════════════════════════════════════════════
 function checkDailyLimit(uid) {
     if (!uid) return true;
@@ -131,14 +112,14 @@ function checkDailyLimit(uid) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// HELPER: In-memory rate window check (Firestore transaction کی بجائے)
+// HELPER: Rate window check
 // ══════════════════════════════════════════════════════════════════════════
 function checkRateLimit(uid, postEntry) {
     if (!uid) return { shouldBundle: false };
-    const nowMs   = Date.now();
-    const cutoff  = nowMs - RATE_WINDOW_MS;
-    let entries   = rateWindowCache.get(uid) || [];
-    entries       = entries.filter(e => e.ts > cutoff);
+    const nowMs  = Date.now();
+    const cutoff = nowMs - RATE_WINDOW_MS;
+    let entries  = rateWindowCache.get(uid) || [];
+    entries      = entries.filter(e => e.ts > cutoff);
     entries.push({ ts: nowMs, ...postEntry });
     rateWindowCache.set(uid, entries);
     if (entries.length > RATE_LIMIT) {
@@ -148,7 +129,7 @@ function checkRateLimit(uid, postEntry) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// HELPER: In-memory post deduplication (Firestore transaction کی بجائے)
+// HELPER: Post dedup
 // ══════════════════════════════════════════════════════════════════════════
 function acquirePostLockMem(postId) {
     if (!postId) return false;
@@ -158,7 +139,7 @@ function acquirePostLockMem(postId) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// HELPER: In-memory chat deduplication (Firestore transaction کی بجائے)
+// HELPER: Chat dedup
 // ══════════════════════════════════════════════════════════════════════════
 function acquireChatLockMem(senderUid, receiverUid) {
     if (!senderUid || !receiverUid) return true;
@@ -170,7 +151,7 @@ function acquireChatLockMem(senderUid, receiverUid) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// HELPER: Invalid tokens کو Firestore سے remove کرنا (ضروری Firestore call)
+// HELPER: Invalid tokens Firestore سے remove کرو
 // ══════════════════════════════════════════════════════════════════════════
 async function removeInvalidTokens(responses, tokens) {
     const batch   = db.batch();
@@ -198,7 +179,7 @@ async function removeInvalidTokens(responses, tokens) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// HELPER: Get single user token (chat/reaction کیلئے)
+// HELPER: Single user token لو
 // ══════════════════════════════════════════════════════════════════════════
 async function getUserToken(uid) {
     if (!uid) return null;
@@ -211,6 +192,12 @@ async function getUserToken(uid) {
 
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTE 1 — POST NOTIFICATION  (/api/server)
+//
+// مسائل جو ٹھیک کیے:
+// 1. ہر یوزر کو صرف ایک نوٹیفکیشن — tag: `post_${postId}` سے enforce
+// 2. نوٹیفکیشن clickable — webpush.fcmOptions.link صحیح URL پر
+// 3. Grouped notifications — tag ایک ہو تو browser خود group بناتا ہے
+// 4. Icon: poster کی photo (senderPhoto) — اگر نہیں تو logo
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/server', async (req, res) => {
     try {
@@ -219,25 +206,27 @@ app.post('/api/server', async (req, res) => {
 
         if (!postId) return res.status(400).json({ success: false, message: "postId is required" });
 
-        // ✅ In-memory dedup — ZERO Firestore cost
+        // ✅ Dedup — ایک پوسٹ کا صرف ایک نوٹیفکیشن
         const locked = acquirePostLockMem(postId);
         if (!locked) {
             console.log("Duplicate suppressed:", postId);
             return res.status(200).json({ success: false, message: "Notification already sent" });
         }
 
+        // ─── Post URL بناؤ ────────────────────────────────────────────
         const postPath = postSlug ? `post/${postSlug}` : `details.html?id=${postId}`;
         const clickUrl = `${BASE_URL}/${postPath}`;
 
         const cleanTitle    = stripHtml(title)    || 'New Post';
         const cleanHospital = stripHtml(hospital) || 'Health Jobs';
         const cleanBody     = stripHtml(body)     || 'Tap to view.';
+        const posterIcon    = getIcon(senderPhoto); // ✅ poster کی پک
 
-        // ⚠️ ONLY Firestore read — all users tokens (unavoidable)
+        // ─── سب users کے tokens لو ────────────────────────────────────
         const usersSnap = await db.collection('users').get();
-        const userMap = new Map();
+        const userMap   = new Map();
         usersSnap.forEach(doc => {
-            if (posterId && doc.id === posterId) return;
+            if (posterId && doc.id === posterId) return; // poster کو نوٹیفکیشن نہیں
             const data = doc.data();
             const raw  = data.fcmToken;
             if (!raw) return;
@@ -260,45 +249,93 @@ app.post('/api/server', async (req, res) => {
         const allTokensUsed = [], allResponses = [];
 
         for (const [uid, { tokens }] of userMap) {
-            // ✅ In-memory check — ZERO Firestore cost
             if (!checkDailyLimit(uid)) { console.log(`Daily limit: ${uid}`); continue; }
-            
-            // ✅ In-memory check — ZERO Firestore cost
+
             const { shouldBundle, count, posts } = checkRateLimit(uid, postEntry);
             let msg;
 
             if (shouldBundle) {
-                const names = [...new Set(posts.map(p => p.poster))].slice(0, 3).join(', ');
+                // ─── Bundle: زیادہ posts ─────────────────────────────────
+                // tag: `bundle_${uid}` → ہر user کا اپنا bundle tag
+                // browser grouped notification دکھائے گا
+                const names    = [...new Set(posts.map(p => p.poster))].slice(0, 3).join(', ');
+                const bundleUrl = `${BASE_URL}/index.html`;
                 msg = {
                     notification: {
-                        title: `${count} New Posts on Health Jobs`,
-                        body: `${count} new posts from ${names}${count > 3 ? ' & others' : ''}`
+                        title: `${count} New Posts`,
+                        body:  `${names}${count > 3 ? ' & others' : ''} نے نئی پوسٹ کی`
                     },
                     webpush: {
-                        notification: { icon: LOGO_URL, badge: LOGO_URL, requireInteraction: false, tag: `bundle_${uid}`, renotify: true },
-                        fcmOptions: { link: `${BASE_URL}/index.html` }
+                        notification: {
+                            icon:               LOGO_URL,
+                            badge:              LOGO_URL,
+                            requireInteraction: false,
+                            // ✅ ایک tag → browser پرانا replace کرے گا (صرف ایک رہے)
+                            tag:                `bundle_${uid}`,
+                            renotify:           true,
+                        },
+                        // ✅ CLICK کرنے پر index.html کھلے گا
+                        fcmOptions: { link: bundleUrl },
+                        // ✅ Web push standard click action
+                        headers:    { Urgency: 'normal' }
                     },
                     android: {
                         priority: 'high',
-                        notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                        notification: {
+                            icon:         'ic_notification',
+                            color:        '#0a66c2',
+                            channel_id:   'high_importance_channel',
+                            click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                        }
                     },
-                    data: { type: 'bundle', count: String(count), clickUrl: `${BASE_URL}/index.html` },
+                    data: {
+                        type:     'bundle',
+                        count:    String(count),
+                        clickUrl: bundleUrl
+                    },
                     tokens
                 };
             } else {
+                // ─── Single post notification ────────────────────────────
+                // tag: `post_${postId}` → سب users کیلئے ایک ہی tag
+                // یعنی ہر user کو صرف ایک نوٹیفکیشن آئے گا اس post کا
                 const notifTitle = `${cleanHospital}: ${cleanTitle}`;
-                const notifBody  = cleanBody.length > 120 ? cleanBody.substring(0, 120) + '...' : cleanBody;
+                const notifBody  = cleanBody.length > 120
+                    ? cleanBody.substring(0, 120) + '...'
+                    : cleanBody;
+
                 msg = {
-                    notification: { title: notifTitle, body: notifBody },
+                    notification: {
+                        title: notifTitle,
+                        body:  notifBody
+                    },
                     webpush: {
-                        notification: { icon: getIcon(senderPhoto), badge: LOGO_URL, requireInteraction: false, tag: `post_${postId}` },
-                        fcmOptions: { link: clickUrl }
+                        notification: {
+                            icon:               posterIcon,   // ✅ poster کی photo
+                            badge:              LOGO_URL,
+                            requireInteraction: false,
+                            // ✅ ایک post کا ایک ہی tag → duplicate نہیں آئے گا
+                            tag:                `post_${postId}`,
+                            renotify:           false,        // same tag پر دوبارہ buzz نہیں
+                        },
+                        // ✅ CLICK → سیدھا post پر جائے
+                        fcmOptions: { link: clickUrl },
+                        headers:    { Urgency: 'normal' }
                     },
                     android: {
                         priority: 'high',
-                        notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                        notification: {
+                            icon:         'ic_notification',
+                            color:        '#0a66c2',
+                            channel_id:   'high_importance_channel',
+                            click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                        }
                     },
-                    data: { postId, type: 'general_post', clickUrl },
+                    data: {
+                        type:     'general_post',
+                        postId:   String(postId),
+                        clickUrl: clickUrl
+                    },
                     tokens
                 };
             }
@@ -310,7 +347,6 @@ app.post('/api/server', async (req, res) => {
             response.responses.forEach(r => allResponses.push(r));
         }
 
-        // ⚠️ Only if there are failures — Firestore write to remove bad tokens
         if (allResponses.some(r => !r.success)) {
             await removeInvalidTokens(allResponses, allTokensUsed);
         }
@@ -332,20 +368,18 @@ app.post('/api/chat', async (req, res) => {
         const { receiverUid, targetToken, senderName, senderUid, senderPhoto, messagePreview } = req.body;
         console.log("Chat Notification:", { senderUid, receiverUid });
 
-        // ✅ In-memory dedup — ZERO Firestore cost
         if (!acquireChatLockMem(senderUid, receiverUid)) {
             return res.status(200).json({ success: false, message: "Duplicate suppressed" });
         }
 
         let token = targetToken;
         if (!token && receiverUid) {
-            token = await getUserToken(receiverUid); // ⚠️ 1 Firestore read
+            token = await getUserToken(receiverUid);
         }
 
         if (!token)     return res.status(400).json({ error: "No FCM token" });
         if (!senderUid) return res.status(400).json({ error: "senderUid required" });
 
-        // ✅ In-memory check
         const limitKey = receiverUid || token.substring(0, 20);
         if (!checkDailyLimit(`chat_${limitKey}`)) {
             return res.status(200).json({ success: false, message: "Daily limit" });
@@ -355,20 +389,37 @@ app.post('/api/chat', async (req, res) => {
         const cleanSender  = stripHtml(senderName) || 'Healthcare User';
         const notifBody    = cleanPreview
             ? (cleanPreview.length > 80 ? cleanPreview.substring(0, 80) + '...' : cleanPreview)
-            : 'You have a new message. Tap to reply.';
+            : 'آپ کو نیا پیغام ملا ہے۔ جواب دینے کیلئے tap کریں۔';
         const clickUrl = `${BASE_URL}/chat.html?uid=${senderUid}`;
 
         const message = {
             notification: { title: cleanSender, body: notifBody },
             webpush: {
-                notification: { icon: getIcon(senderPhoto), badge: LOGO_URL, requireInteraction: false, tag: `chat_${senderUid}`, renotify: true },
-                fcmOptions: { link: clickUrl }
+                notification: {
+                    icon:               getIcon(senderPhoto),
+                    badge:              LOGO_URL,
+                    requireInteraction: false,
+                    tag:                `chat_${senderUid}`,
+                    renotify:           true
+                },
+                // ✅ CLICK → chat کھلے
+                fcmOptions: { link: clickUrl },
+                headers:    { Urgency: 'high' }
             },
             android: {
                 priority: 'high',
-                notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                notification: {
+                    icon:         'ic_notification',
+                    color:        '#0a66c2',
+                    channel_id:   'high_importance_channel',
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                }
             },
-            data: { type: 'chat_message', senderUid: String(senderUid), clickUrl },
+            data: {
+                type:      'chat_message',
+                senderUid: String(senderUid),
+                clickUrl:  clickUrl
+            },
             token
         };
 
@@ -394,7 +445,7 @@ app.post('/api/call', async (req, res) => {
         if (!targetToken) return res.status(400).json({ error: "targetToken required" });
 
         if (action === 'cancel') {
-            const r = await admin.messaging().send({
+            await admin.messaging().send({
                 data: { action: 'cancel_call', callerUid: String(callerUid || '') },
                 android: { priority: 'high', ttl: 10000 },
                 webpush: { headers: { TTL: '10' } },
@@ -407,22 +458,42 @@ app.post('/api/call', async (req, res) => {
         const cleanCallerName = stripHtml(callerName) || 'Health Jobs User';
         const callText        = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
 
-        const r = await admin.messaging().send({
+        await admin.messaging().send({
             notification: { title: cleanCallerName, body: callText },
             webpush: {
-                notification: { icon: getIcon(callerPhoto), badge: LOGO_URL, requireInteraction: true, tag: `call_${callerUid}`, vibrate: [200, 100, 200, 100, 200] },
+                notification: {
+                    icon:               getIcon(callerPhoto),
+                    badge:              LOGO_URL,
+                    requireInteraction: true,  // call پر dismiss نہ ہو
+                    tag:                `call_${callerUid}`,
+                    vibrate:            [200, 100, 200, 100, 200]
+                },
+                // ✅ CLICK → call screen کھلے
                 fcmOptions: { link: clickUrl },
-                headers: { TTL: '30' }
+                headers:    { TTL: '30', Urgency: 'high' }
             },
             android: {
-                priority: 'high', ttl: 30000,
-                notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK', tag: `call_${callerUid}` }
+                priority: 'high',
+                ttl:      30000,
+                notification: {
+                    icon:         'ic_notification',
+                    color:        '#0a66c2',
+                    channel_id:   'high_importance_channel',
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK',
+                    tag:          `call_${callerUid}`
+                }
             },
-            data: { isCall: 'true', callerUid: String(callerUid || ''), callerName: cleanCallerName, callType: String(callType || 'audio'), clickUrl },
+            data: {
+                isCall:     'true',
+                callerUid:  String(callerUid || ''),
+                callerName: cleanCallerName,
+                callType:   String(callType || 'audio'),
+                clickUrl:   clickUrl
+            },
             token: targetToken
         });
 
-        console.log("Call sent:", r);
+        console.log("Call notification sent");
         return res.status(200).json({ success: true, type: 'call' });
 
     } catch (error) {
@@ -444,16 +515,15 @@ app.post('/api/reaction', async (req, res) => {
         if (!type || !['like', 'comment'].includes(type)) return res.status(400).json({ error: "type must be like/comment" });
         if (actorUid && actorUid === postOwnerId) return res.status(200).json({ success: false, message: "Self-reaction" });
 
-        // ✅ In-memory check
         if (!checkDailyLimit(`reaction_${postOwnerId}`)) {
             return res.status(200).json({ success: false, message: "Daily limit" });
         }
 
-        const token = await getUserToken(postOwnerId); // ⚠️ 1 Firestore read
+        const token = await getUserToken(postOwnerId);
         if (!token) return res.status(200).json({ success: false, message: "No token" });
 
-        const postPath  = postSlug ? `post/${postSlug}` : `details.html?id=${postId}`;
-        const clickUrl  = `${BASE_URL}/${postPath}`;
+        const postPath   = postSlug ? `post/${postSlug}` : `details.html?id=${postId}`;
+        const clickUrl   = `${BASE_URL}/${postPath}`;
         const cleanActor = stripHtml(actorName) || 'Someone';
         const cleanTitle = stripHtml(postTitle);
         const cleanCmnt  = stripHtml(commentPreview);
@@ -461,30 +531,48 @@ app.post('/api/reaction', async (req, res) => {
 
         let notifTitle, notifBody;
         if (type === 'like') {
-            notifTitle = `${cleanActor} liked your post`;
+            notifTitle = `${cleanActor} نے آپ کی پوسٹ like کی`;
             notifBody  = `${cleanActor} liked ${pTitle}`;
         } else {
-            notifTitle = `${cleanActor} commented on your post`;
+            notifTitle = `${cleanActor} نے comment کیا`;
             notifBody  = cleanCmnt
                 ? `${cleanActor}: ${cleanCmnt.length > 80 ? cleanCmnt.substring(0, 80) + '...' : cleanCmnt}`
                 : `${cleanActor} commented on ${pTitle}`;
         }
 
-        const r = await admin.messaging().send({
+        await admin.messaging().send({
             notification: { title: notifTitle, body: notifBody },
             webpush: {
-                notification: { icon: getIcon(actorPhoto), badge: LOGO_URL, requireInteraction: false, tag: `${type}_${postId}_${actorUid || Date.now()}`, renotify: true },
-                fcmOptions: { link: clickUrl }
+                notification: {
+                    icon:               getIcon(actorPhoto),
+                    badge:              LOGO_URL,
+                    requireInteraction: false,
+                    tag:                `${type}_${postId}_${actorUid || Date.now()}`,
+                    renotify:           true
+                },
+                // ✅ CLICK → post پر جاؤ
+                fcmOptions: { link: clickUrl },
+                headers:    { Urgency: 'normal' }
             },
             android: {
                 priority: 'normal',
-                notification: { icon: 'ic_notification', color: '#e91e63', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                notification: {
+                    icon:         'ic_notification',
+                    color:        '#e91e63',
+                    channel_id:   'high_importance_channel',
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                }
             },
-            data: { type: `reaction_${type}`, postId: String(postId || ''), actorUid: String(actorUid || ''), clickUrl },
+            data: {
+                type:     `reaction_${type}`,
+                postId:   String(postId || ''),
+                actorUid: String(actorUid || ''),
+                clickUrl: clickUrl
+            },
             token
         });
 
-        console.log(`${type} sent:`, r);
+        console.log(`${type} notification sent`);
         return res.status(200).json({ success: true, type });
 
     } catch (error) {
@@ -495,7 +583,7 @@ app.post('/api/reaction', async (req, res) => {
 
 
 // ══════════════════════════════════════════════════════════════════════════
-// ROUTE 5 — /api (legacy)
+// ROUTE 5 — /api (legacy call route)
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api', async (req, res) => {
     const { targetToken, callerName, callerUid, callerPhoto, callType, action } = req.body;
@@ -515,21 +603,38 @@ app.post('/api', async (req, res) => {
 
     try {
         const cleanCallerName = stripHtml(callerName) || 'Health Jobs User';
-        const clickUrl = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
-        const callText = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
+        const clickUrl  = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
+        const callText  = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
 
         await admin.messaging().send({
             notification: { title: cleanCallerName, body: callText },
             webpush: {
-                notification: { icon: getIcon(callerPhoto), badge: LOGO_URL, requireInteraction: true, tag: `call_${callerUid}` },
+                notification: {
+                    icon:               getIcon(callerPhoto),
+                    badge:              LOGO_URL,
+                    requireInteraction: true,
+                    tag:                `call_${callerUid}`
+                },
                 fcmOptions: { link: clickUrl },
-                headers: { TTL: '30' }
+                headers:    { TTL: '30', Urgency: 'high' }
             },
             android: {
-                priority: 'high', ttl: 30000,
-                notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                priority: 'high',
+                ttl:      30000,
+                notification: {
+                    icon:         'ic_notification',
+                    color:        '#0a66c2',
+                    channel_id:   'high_importance_channel',
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                }
             },
-            data: { isCall: 'true', callerUid: String(callerUid || ''), callerName: cleanCallerName, callType: String(callType || 'audio'), clickUrl },
+            data: {
+                isCall:     'true',
+                callerUid:  String(callerUid || ''),
+                callerName: cleanCallerName,
+                callType:   String(callType || 'audio'),
+                clickUrl:   clickUrl
+            },
             token: targetToken
         });
         return res.status(200).json({ success: true, type: 'call' });
