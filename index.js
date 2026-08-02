@@ -208,6 +208,11 @@ async function getUserToken(uid) {
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTE 1 — POST NOTIFICATION  (/api/server)
 // Click → notifications.html?highlight=postId
+//
+// ⚠️ FIX: top-level `notification` field ہٹا دیا گیا ہے۔ اب title/body/icon
+// صرف `data` میں جاتے ہیں تاکہ SW کا onBackgroundMessage ہمیشہ چلے اور
+// notificationclick میں صحیح clickUrl ملے (Firebase کا auto-display کبھی
+// درمیان میں نہ آئے)۔
 // ══════════════════════════════════════════════════════════════════════════
 app.post('/api/server', async (req, res) => {
     try {
@@ -258,51 +263,49 @@ app.post('/api/server', async (req, res) => {
                 // Bundle notification
                 const names      = [...new Set(posts.map(p => p.poster))].slice(0, 2).join(', ');
                 const bundleUrl  = NOTIF_PAGE;
+                const bundleTitle = `${count} New Posts on Health Jobs`;
+                const bundleBody  = `${names}${count > 2 ? ` and ${count - 2} others` : ''} posted new jobs`;
+
                 msg = {
-                    notification: {
-                        title: `${count} New Posts on Health Jobs`,
-                        body:  `${names}${count > 2 ? ` and ${count - 2} others` : ''} posted new jobs`
-                    },
                     webpush: {
-                        notification: {
-                            icon:               LOGO_URL,
-                            badge:              LOGO_URL,
-                            requireInteraction: false,
-                            tag:                `bundle_${uid}`,
-                            renotify:           true
-                        },
-                        fcmOptions: { link: bundleUrl },
-                        headers:    { Urgency: 'normal' }
+                        headers: { Urgency: 'normal' }
                     },
                     android: {
-                        priority: 'high',
-                        notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                        priority: 'high'
                     },
-                    data: { type: 'bundle', count: String(count), clickUrl: bundleUrl },
+                    data: {
+                        type:     'bundle',
+                        title:    bundleTitle,
+                        body:     bundleBody,
+                        icon:     LOGO_URL,
+                        tag:      `bundle_${uid}`,
+                        count:    String(count),
+                        clickUrl: bundleUrl
+                    },
                     tokens
                 };
             } else {
                 // Single post notification
                 const notifTitle = `${cleanHospital}: ${cleanTitle}`;
                 const notifBody  = cleanBody.length > 120 ? cleanBody.substring(0, 120) + '...' : cleanBody;
+
                 msg = {
-                    notification: { title: notifTitle, body: notifBody },
                     webpush: {
-                        notification: {
-                            icon:               posterIcon,
-                            badge:              LOGO_URL,
-                            requireInteraction: false,
-                            tag:                `post_${postId}`,
-                            renotify:           false
-                        },
-                        fcmOptions: { link: clickUrl },
-                        headers:    { Urgency: 'normal' }
+                        headers: { Urgency: 'normal' }
                     },
                     android: {
-                        priority: 'high',
-                        notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                        priority: 'high'
                     },
-                    data: { type: 'general_post', postId: String(postId), postSlug: String(postSlug || postId), clickUrl },
+                    data: {
+                        type:     'general_post',
+                        title:    notifTitle,
+                        body:     notifBody,
+                        icon:     posterIcon,
+                        tag:      `post_${postId}`,
+                        postId:   String(postId),
+                        postSlug: String(postSlug || postId),
+                        clickUrl
+                    },
                     tokens
                 };
             }
@@ -356,24 +359,18 @@ async function sendChatNotification(receiverUid, token, group) {
 
     try {
         await admin.messaging().send({
-            notification: { title, body },
             webpush: {
-                notification: {
-                    icon:               getIcon(senderPic),
-                    badge:              LOGO_URL,
-                    requireInteraction: false,
-                    tag:                `chat_${senderUid}`,  // ایک sender کا ایک tag
-                    renotify:           true
-                },
-                fcmOptions: { link: clickUrl },
-                headers:    { Urgency: 'high' }
+                headers: { Urgency: 'high' }
             },
             android: {
-                priority: 'high',
-                notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                priority: 'high'
             },
             data: {
                 type:      'chat_message',
+                title,
+                body,
+                icon:      getIcon(senderPic),
+                tag:       `chat_${senderUid}`,
                 senderUid: String(senderUid),
                 count:     String(count),
                 clickUrl
@@ -476,24 +473,25 @@ app.post('/api/call', async (req, res) => {
         const clickUrl     = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
 
         await admin.messaging().send({
-            notification: { title: cleanName, body: callText },
             webpush: {
-                notification: {
-                    icon:               getIcon(callerPhoto),
-                    badge:              LOGO_URL,
-                    requireInteraction: true,
-                    tag:                `call_${callerUid}`,
-                    vibrate:            [200, 100, 200, 100, 200]
-                },
-                fcmOptions: { link: clickUrl },
-                headers:    { TTL: '30', Urgency: 'high' }
+                headers: { TTL: '30', Urgency: 'high' }
             },
             android: {
                 priority: 'high',
-                ttl:      30000,
-                notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK', tag: `call_${callerUid}` }
+                ttl:      30000
             },
-            data: { isCall: 'true', callerUid: String(callerUid || ''), callerName: cleanName, callType: String(callType || 'audio'), clickUrl },
+            data: {
+                isCall:     'true',
+                type:       'call',
+                title:      cleanName,
+                body:       callText,
+                icon:       getIcon(callerPhoto),
+                tag:        `call_${callerUid}`,
+                callerUid:  String(callerUid || ''),
+                callerName: cleanName,
+                callType:   String(callType || 'audio'),
+                clickUrl
+            },
             token: targetToken
         });
 
@@ -552,23 +550,21 @@ async function sendReactionNotification(postOwnerId, token, group, clickUrl) {
 
     try {
         await admin.messaging().send({
-            notification: { title, body },
             webpush: {
-                notification: {
-                    icon:               getIcon(group.posts[0].actorPhoto),
-                    badge:              LOGO_URL,
-                    requireInteraction: false,
-                    tag:                `reaction_${postOwnerId}`,
-                    renotify:           true
-                },
-                fcmOptions: { link: clickUrl },
-                headers:    { Urgency: 'normal' }
+                headers: { Urgency: 'normal' }
             },
             android: {
-                priority: 'normal',
-                notification: { icon: 'ic_notification', color: '#e91e63', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                priority: 'normal'
             },
-            data: { type: 'reaction_group', count: String(count), clickUrl },
+            data: {
+                type:     'reaction_group',
+                title,
+                body,
+                icon:     getIcon(group.posts[0].actorPhoto),
+                tag:      `reaction_${postOwnerId}`,
+                count:    String(count),
+                clickUrl
+            },
             token
         });
         console.log(`Reaction sent: ${count} item(s) to ${postOwnerId}`);
@@ -676,23 +672,25 @@ app.post('/api', async (req, res) => {
         const callText   = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
 
         await admin.messaging().send({
-            notification: { title: cleanName, body: callText },
             webpush: {
-                notification: {
-                    icon:               getIcon(callerPhoto),
-                    badge:              LOGO_URL,
-                    requireInteraction: true,
-                    tag:                `call_${callerUid}`
-                },
-                fcmOptions: { link: clickUrl },
-                headers:    { TTL: '30', Urgency: 'high' }
+                headers: { TTL: '30', Urgency: 'high' }
             },
             android: {
                 priority: 'high',
-                ttl:      30000,
-                notification: { icon: 'ic_notification', color: '#0a66c2', channel_id: 'high_importance_channel', click_action: 'FLUTTER_NOTIFICATION_CLICK' }
+                ttl:      30000
             },
-            data: { isCall: 'true', callerUid: String(callerUid || ''), callerName: cleanName, callType: String(callType || 'audio'), clickUrl },
+            data: {
+                isCall:     'true',
+                type:       'call',
+                title:      cleanName,
+                body:       callText,
+                icon:       getIcon(callerPhoto),
+                tag:        `call_${callerUid}`,
+                callerUid:  String(callerUid || ''),
+                callerName: cleanName,
+                callType:   String(callType || 'audio'),
+                clickUrl
+            },
             token: targetToken
         });
 
