@@ -806,6 +806,90 @@ app.post('/api/reaction', async (req, res) => {
 app.post('/api', handleCallRequest);
 
 
+// ══════════════════════════════════════════════════════════════════════════
+// ROUTE 7 — ADMIN PUSH  (/api/admin-push)
+//
+// Admin Worker (compose.html wala) sirf Firestore mein in-app entries likhta tha,
+// FCM push kabhi nahi jati thi. Yeh route sirf PUSH bhejta hai (in-app entry
+// Worker khud likh chuka hota hai — is liye yahan dobara nahi likhte, warna
+// duplicate banti).
+//
+// Auth: header `x-push-admin-secret` == process.env.PUSH_ADMIN_SECRET
+//       (yeh secret sirf Worker aur Vercel env mein hai, kisi page mein nahi).
+// Body: { uids: [..max 1000], title, body, link? }
+// ══════════════════════════════════════════════════════════════════════════
+app.post('/api/admin-push', async (req, res) => {
+    try {
+        const secret = process.env.PUSH_ADMIN_SECRET;
+        if (!secret) return res.status(500).json({ error: 'PUSH_ADMIN_SECRET not configured on server' });
+        if (req.get('x-push-admin-secret') !== secret) return res.status(401).json({ error: 'Unauthorized' });
+
+        const { uids, title, body, link } = req.body || {};
+        if (!Array.isArray(uids) || !uids.length) return res.status(400).json({ error: 'uids required' });
+        if (uids.length > 1000)                   return res.status(400).json({ error: 'max 1000 uids per request' });
+        if (!title || !String(title).trim())      return res.status(400).json({ error: 'title required' });
+
+        const cleanTitle = stripHtml(title) || 'Health Jobs Portal';
+        const cleanBody  = stripHtml(body).substring(0, 180);
+        // Sirf https:// ya /relative link; warna notifications page
+        const clickUrl   = /^(https?:\/\/|\/)/i.test(String(link || '')) ? String(link) : NOTIF_PAGE;
+
+        // ── Users ke tokens (300 ke chunks mein getAll) ──
+        const refs = [...new Set(uids.map(String))]
+            .filter(u => u && !u.includes('/'))
+            .map(u => db.collection('users').doc(u));
+
+        const tokens = [];
+        let noToken = 0;
+        for (let i = 0; i < refs.length; i += 300) {
+            const snaps = await db.getAll(...refs.slice(i, i + 300));
+            snaps.forEach(snap => {
+                if (!snap.exists) { noToken++; return; }
+                const raw  = snap.data().fcmToken;
+                const list = (Array.isArray(raw) ? raw : [raw]).filter(t => t && String(t).length > 10);
+                if (!list.length) noToken++;
+                else list.forEach(t => tokens.push(t));
+            });
+        }
+        const unique = [...new Set(tokens)];
+        if (!unique.length) return res.status(200).json({ success: true, sent: 0, failed: 0, noToken });
+
+        const tag = `admin_${Date.now()}`;
+        let sent = 0, failed = 0;
+        const allTokens = [], allResponses = [];
+
+        for (let i = 0; i < unique.length; i += 500) {
+            const chunk = unique.slice(i, i + 500);
+            const r = await admin.messaging().sendEachForMulticast({
+                webpush: { headers: { Urgency: 'high' } },
+                android: { priority: 'high' },
+                data: {
+                    type:     'admin_announcement',
+                    title:    cleanTitle,
+                    body:     cleanBody,
+                    icon:     LOGO_URL,
+                    tag,
+                    clickUrl
+                },
+                tokens: chunk
+            });
+            sent   += r.successCount;
+            failed += r.failureCount;
+            chunk.forEach(t => allTokens.push(t));
+            r.responses.forEach(x => allResponses.push(x));
+        }
+
+        if (allResponses.some(r => !r.success)) await removeInvalidTokens(allResponses, allTokens);
+
+        return res.status(200).json({ success: true, sent, failed, noToken });
+
+    } catch (error) {
+        console.error('Admin Push Error:', error.message);
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+
 // ══════════════════════════════════════════════════
 // ROUTE 6 — PORTAL EVENT NOTIFICATION  (/api/portal)
 //
