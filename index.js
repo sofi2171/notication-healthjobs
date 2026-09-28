@@ -208,10 +208,17 @@ async function removeInvalidTokens(responses, tokens) {
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER: Single user ka FCM token
 // ══════════════════════════════════════════════════════════════════════════
+function isPushAllowed(data) {
+    const p = data?.notificationPrefs;
+    if (!p) return true;                       // prefs nahi → default ON
+    return p.pushNotifications !== false && p.notifications !== false;
+}
+
 async function getUserToken(uid) {
     if (!uid) return null;
     const d = await db.collection('users').doc(uid).get();
     if (!d.exists) return null;
+    if (!isPushAllowed(d.data())) return null;
     const raw = d.data().fcmToken;
     return Array.isArray(raw) ? raw[0] : raw;
 }
@@ -252,6 +259,7 @@ app.post('/api/server', async (req, res) => {
         usersSnap.forEach(doc => {
             if (posterId && doc.id === posterId) return;
             const data   = doc.data();
+            if (!isPushAllowed(data)) return;
             const raw    = data.fcmToken;
             if (!raw) return;
             const tokens = (Array.isArray(raw) ? raw : [raw]).filter(t => t && t.length > 10);
@@ -845,6 +853,7 @@ app.post('/api/admin-push', async (req, res) => {
             const snaps = await db.getAll(...refs.slice(i, i + 300));
             snaps.forEach(snap => {
                 if (!snap.exists) { noToken++; return; }
+                if (!isPushAllowed(snap.data())) { noToken++; return; }
                 const raw  = snap.data().fcmToken;
                 const list = (Array.isArray(raw) ? raw : [raw]).filter(t => t && String(t).length > 10);
                 if (!list.length) noToken++;
