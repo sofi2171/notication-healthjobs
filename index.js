@@ -168,6 +168,18 @@ function acquireChatLock(senderUid, receiverUid) {
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER: Invalid tokens Firestore سے remove کرو
 // ══════════════════════════════════════════════════════════════════════════
+async function writeInAppNotification(docData) {
+    try {
+        await db.collection('notifications').add({
+            ...docData,
+            createdAt: Date.now(),
+            read: false
+        });
+    } catch (e) {
+        console.error('In-app notification write failed:', e.message);
+    }
+}
+
 async function removeInvalidTokens(responses, tokens) {
     const batch    = db.batch();
     let removed    = 0;
@@ -448,16 +460,121 @@ app.post('/api/chat', async (req, res) => {
 
 
 // ══════════════════════════════════════════════════════════════════════════
-// ROUTE 3 — CALL NOTIFICATION  (/api/call)
+// ROUTE 3 — CALL NOTIFICATION + CALL LOG  (/api/call  aur legacy /api)
+//
+// Actions (body.action):
+//   (none)     → call ring:  FCM push + notifications.html mein "ringing" entry
+//   'cancel'   → caller ne ring khatam ki (ya 45s timeout) → callee ko "Missed call"
+//   'decline'  → callee ne reject kiya   → dono ke liye "declined" entry
+//   'answered' → call connect hui / khatam hui (duration ke sath) → dono ke liye
+//
+// Har call ki ek `callId` hoti hai (chat.html banata hai). Notification doc ka
+// ID deterministic hai (call_<callId>_<uid>) is liye ek call = ek entry, aur
+// status badalne par wahi entry update hoti hai (duplicate nahi banti).
 // ══════════════════════════════════════════════════════════════════════════
-app.post('/api/call', async (req, res) => {
+function cleanCallId(id) {
+    return String(id || '').replace(/[^A-Za-z0-9_-]/g, '').substring(0, 120);
+}
+
+function fmtDuration(sec) {
+    sec = Math.max(0, parseInt(sec, 10) || 0);
+    const m = Math.floor(sec / 60), s = sec % 60;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+async function getUserBasic(uid) {
+    const fallback = { name: 'Health Jobs User', photo: '' };
+    if (!uid) return fallback;
     try {
-        const { targetToken, callerName, callerUid, callerPhoto, callType, action } = req.body;
-        console.log("Call:", { callerUid, action });
+        const d = await db.collection('users').doc(String(uid)).get();
+        if (!d.exists) return fallback;
+        const u = d.data() || {};
+        return {
+            name:  stripHtml(u.facilityName || u.fullName) || fallback.name,
+            photo: u.profilePicUrl || ''
+        };
+    } catch (_) { return fallback; }
+}
+
+function callMessage(role, status, callType, duration) {
+    const kind = callType === 'video' ? 'video call' : 'audio call';
+    if (role === 'incoming') {
+        if (status === 'ringing')  return `Incoming ${kind}`;
+        if (status === 'missed')   return `Missed ${kind}`;
+        if (status === 'declined') return `You declined the ${kind}`;
+        return duration ? `${kind} · ${fmtDuration(duration)}` : kind;
+    }
+    if (status === 'no_answer') return 'No answer';
+    if (status === 'declined')  return `${kind} declined`;
+    return duration ? `${kind} · ${fmtDuration(duration)}` : kind;
+}
+
+async function writeCallLog({ callId, ownerUid, otherUid, otherName, otherPhoto, role, status, callType, duration = 0, unread = false }) {
+    if (!callId || !ownerUid) return;
+    try {
+        await db.collection('notifications').doc(`call_${callId}_${ownerUid}`).set({
+            type:         'call',
+            callId,
+            callStatus:   status,
+            callRole:     role,
+            callType:     callType === 'video' ? 'video' : 'audio',
+            callDuration: parseInt(duration, 10) || 0,
+            toUid:        String(ownerUid),
+            fromUid:      String(otherUid || ''),
+            actorUid:     String(otherUid || ''),
+            fromName:     otherName,
+            actorName:    otherName,
+            fromPic:      getIcon(otherPhoto),
+            message:      callMessage(role, status, callType, duration),
+            link:         `/chat.html?uid=${otherUid}`,
+            postId:       '',
+            postSlug:     '',
+            createdAt:    Date.now(),
+            read:         !unread
+        }, { merge: true });
+    } catch (e) {
+        console.error('Call log write failed:', e.message);
+    }
+}
+
+// Call ka final outcome dono users ke notifications mein likho
+async function logCallOutcome({ callId, callerUid, calleeUid, callType, outcome, duration }) {
+    const [caller, callee] = await Promise.all([getUserBasic(callerUid), getUserBasic(calleeUid)]);
+    // callee ki entry: (other = caller)   |   caller ki entry: (other = callee)
+    const map = {
+        missed:   { callee: 'missed',   caller: 'no_answer', calleeUnread: true,  callerUnread: false },
+        declined: { callee: 'declined', caller: 'declined',  calleeUnread: false, callerUnread: true  },
+        answered: { callee: 'answered', caller: 'answered',  calleeUnread: false, callerUnread: false }
+    }[outcome];
+    if (!map) return;
+
+    await Promise.all([
+        writeCallLog({ callId, ownerUid: calleeUid, otherUid: callerUid, otherName: caller.name, otherPhoto: caller.photo,
+                       role: 'incoming', status: map.callee, callType, duration, unread: map.calleeUnread }),
+        writeCallLog({ callId, ownerUid: callerUid, otherUid: calleeUid, otherName: callee.name, otherPhoto: callee.photo,
+                       role: 'outgoing', status: map.caller, callType, duration, unread: map.callerUnread })
+    ]);
+}
+
+async function handleCallRequest(req, res) {
+    try {
+        const { targetToken, callerName, callerUid, callerPhoto, callType, action, callId, calleeUid, duration } = req.body || {};
+        const type = callType === 'video' ? 'video' : 'audio';
+        const cid  = cleanCallId(callId);
+        console.log("Call:", { callerUid, calleeUid, action, callId: cid });
+
+        // ── Decline / Answered — sirf log, push ki zaroorat nahi ──────────
+        if (action === 'decline' || action === 'answered') {
+            if (!cid || !callerUid || !calleeUid) return res.status(400).json({ error: "callId, callerUid, calleeUid required" });
+            await logCallOutcome({ callId: cid, callerUid, calleeUid, callType: type, outcome: action, duration });
+            return res.status(200).json({ success: true, type: action });
+        }
 
         if (!targetToken) return res.status(400).json({ error: "targetToken required" });
 
-        // Cancel call
+        const cleanName = stripHtml(callerName) || 'Health Jobs User';
+
+        // ── Cancel (caller ne kaat di / koi jawab nahi) → Missed call ─────
         if (action === 'cancel') {
             await admin.messaging().send({
                 data: { action: 'cancel_call', callerUid: String(callerUid || '') },
@@ -465,35 +582,69 @@ app.post('/api/call', async (req, res) => {
                 webpush: { headers: { TTL: '10' } },
                 token: targetToken
             });
+
+            if (cid && callerUid && calleeUid) {
+                await logCallOutcome({ callId: cid, callerUid, calleeUid, callType: type, outcome: 'missed' });
+            }
+
+            // Missed-call push — click par notifications page khule
+            try {
+                await admin.messaging().send({
+                    webpush: { headers: { Urgency: 'high' } },
+                    android: { priority: 'high' },
+                    data: {
+                        type:      'call_missed',
+                        title:     cleanName,
+                        body:      `Missed ${type} call`,
+                        icon:      getIcon(callerPhoto),
+                        tag:       `missed_${callerUid}`,
+                        callerUid: String(callerUid || ''),
+                        clickUrl:  NOTIF_PAGE
+                    },
+                    token: targetToken
+                });
+            } catch (e) { console.error("Missed-call push error:", e.message); }
+
             return res.status(200).json({ success: true, type: 'cancel' });
         }
 
-        const cleanName    = stripHtml(callerName) || 'Health Jobs User';
-        const callText     = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
-        const clickUrl     = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
+        // ── Ring (nayi call) ──────────────────────────────────────────────
+        const callText = type === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
+        // Click → seedha chat.html ki call screen
+        const clickUrl = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${type}&incoming=true`;
 
-        await admin.messaging().send({
-            webpush: {
-                headers: { TTL: '30', Urgency: 'high' }
-            },
-            android: {
-                priority: 'high',
-                ttl:      30000
-            },
-            data: {
-                isCall:     'true',
-                type:       'call',
-                title:      cleanName,
-                body:       callText,
-                icon:       getIcon(callerPhoto),
-                tag:        `call_${callerUid}`,
-                callerUid:  String(callerUid || ''),
-                callerName: cleanName,
-                callType:   String(callType || 'audio'),
-                clickUrl
-            },
-            token: targetToken
-        });
+        const tasks = [
+            admin.messaging().send({
+                webpush: { headers: { TTL: '30', Urgency: 'high' } },
+                android: { priority: 'high', ttl: 30000 },
+                data: {
+                    isCall:     'true',
+                    type:       'call',
+                    title:      cleanName,
+                    body:       callText,
+                    icon:       getIcon(callerPhoto),
+                    tag:        `call_${callerUid}`,
+                    callerUid:  String(callerUid || ''),
+                    callerName: cleanName,
+                    callType:   type,
+                    callId:     cid,
+                    clickUrl
+                },
+                token: targetToken
+            })
+        ];
+
+        // notifications.html mein "Incoming call" entry
+        if (cid && callerUid && calleeUid) {
+            tasks.push(writeCallLog({
+                callId: cid, ownerUid: calleeUid, otherUid: callerUid,
+                otherName: cleanName, otherPhoto: callerPhoto,
+                role: 'incoming', status: 'ringing', callType: type, unread: true
+            }));
+        }
+
+        const results = await Promise.allSettled(tasks);
+        if (results[0].status === 'rejected') throw results[0].reason;
 
         return res.status(200).json({ success: true, type: 'call' });
 
@@ -501,7 +652,9 @@ app.post('/api/call', async (req, res) => {
         console.error("Call Error:", error.message);
         return res.status(500).json({ error: error.message });
     }
-});
+}
+
+app.post('/api/call', handleCallRequest);
 
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -648,54 +801,111 @@ app.post('/api/reaction', async (req, res) => {
 
 
 // ══════════════════════════════════════════════════════════════════════════
-// ROUTE 5 — /api (legacy call route)
+// ROUTE 5 — /api (legacy call route) — ab wahi handler
 // ══════════════════════════════════════════════════════════════════════════
-app.post('/api', async (req, res) => {
-    const { targetToken, callerName, callerUid, callerPhoto, callType, action } = req.body;
-    if (!targetToken) return res.status(400).json({ error: "targetToken required" });
+app.post('/api', handleCallRequest);
 
-    if (action === 'cancel') {
-        try {
-            await admin.messaging().send({
-                data: { action: 'cancel_call', callerUid: String(callerUid || '') },
-                android: { priority: 'high', ttl: 10000 },
-                webpush: { headers: { TTL: '10' } },
-                token: targetToken
-            });
-            return res.status(200).json({ success: true, type: 'cancel' });
-        } catch (e) { return res.status(500).json({ error: e.message }); }
-    }
 
+// ══════════════════════════════════════════════════
+// ROUTE 6 — PORTAL EVENT NOTIFICATION  (/api/portal)
+//
+// Yeh route admin approval panel aur ad manager use karte hain: jab bhi
+// kisi user ke account ya ad order par koi faisla hota hai, usay us ke
+// notifications page par ek saaf, professional update milti hai.
+//
+// Ek hi call se do cheezein hoti hain:
+//   1. Firestore notification doc  → notifications.html ki realtime list
+//                                    (type 'admin_announcement' = "Portal Updates")
+//   2. FCM web push                → browser band ho to bhi pahunch jaye
+//
+// Email yahan se NAHI jati — woh har worker khud bhejta hai, kyunke asli
+// content/context usi ke paas hota hai (aur email opt-out ka hisaab bhi).
+//
+// Body: { toUid?, toEmail?, type?, title, body, link?, icon?, tag? }
+//   toUid   : user ka Firebase uid (best — push ke liye lazmi)
+//   toEmail : uid na ho to email se user dhundh liya jata hai
+//   type    : default 'admin_announcement' (notifications.html isay
+//             "Portal Updates" group mein dikhata hai)
+// ══════════════════════════════════════════════════
+app.post('/api/portal', async (req, res) => {
     try {
-        const cleanName  = stripHtml(callerName) || 'Health Jobs User';
-        const clickUrl   = `${BASE_URL}/chat.html?uid=${callerUid}&startCall=true&callType=${callType || 'audio'}&incoming=true`;
-        const callText   = callType === 'video' ? 'Incoming Video Call' : 'Incoming Audio Call';
+        const {
+            toUid, toEmail,
+            type = 'admin_announcement',
+            title, body,
+            link = '',
+            icon = LOGO_URL,
+            tag  = '',
+            fromName = 'Health Jobs Team'
+        } = req.body || {};
 
-        await admin.messaging().send({
-            webpush: {
-                headers: { TTL: '30', Urgency: 'high' }
-            },
-            android: {
-                priority: 'high',
-                ttl:      30000
-            },
-            data: {
-                isCall:     'true',
-                type:       'call',
-                title:      cleanName,
-                body:       callText,
-                icon:       getIcon(callerPhoto),
-                tag:        `call_${callerUid}`,
-                callerUid:  String(callerUid || ''),
-                callerName: cleanName,
-                callType:   String(callType || 'audio'),
-                clickUrl
-            },
-            token: targetToken
+        if (!toUid && !toEmail) return res.status(400).json({ success: false, message: 'toUid or toEmail required' });
+        if (!title || !String(title).trim()) return res.status(400).json({ success: false, message: 'title required' });
+
+        // ── Recipient dhundo ──────────────────────────────────────
+        let uid = String(toUid || '').trim();
+        if (!uid && toEmail) {
+            const q = await db.collection('users').where('email', '==', String(toEmail).toLowerCase()).limit(1).get();
+            if (!q.empty) uid = q.docs[0].id;
+        }
+        if (!uid) return res.status(200).json({ success: false, message: 'User not found' });
+
+        const cleanTitle = stripHtml(title) || 'Health Jobs Portal';
+        const cleanBody  = stripHtml(body)  || '';
+
+        // ── 1) In-app notification (notifications.html realtime list) ──
+        await writeInAppNotification({
+            type:      String(type),
+            toUid:     uid,
+            fromUid:   'admin',
+            actorUid:  'admin',
+            fromName:  String(fromName),
+            actorName: String(fromName),
+            fromPic:   getIcon(icon),
+            message:   cleanBody.substring(0, 300),
+            title:     cleanTitle,
+            link:      link || '',
+            postId:    '',
+            postSlug:  ''
         });
 
-        return res.status(200).json({ success: true, type: 'call' });
-    } catch (e) { return res.status(500).json({ error: e.message }); }
+        // ── 2) FCM web push ────────────────────────────────────────
+        // Data-only payload — SW ka onBackgroundMessage khud show karta hai
+        // aur clickUrl set karta hai. Top-level `notification` block na
+        // hone se Firebase ka auto-display beech mein nahi aata.
+        const token = await getUserToken(uid);
+        if (!token) return res.status(200).json({ success: true, inApp: true, push: false, message: 'No device token' });
+
+        const response = await admin.messaging().sendEachForMulticast({
+            webpush: { headers: { Urgency: 'high' } },
+            android: { priority: 'high' },
+            data: {
+                type:     String(type),
+                title:    cleanTitle,
+                body:     cleanBody.substring(0, 180),
+                icon:     getIcon(icon),
+                tag:      String(tag || `${type}_${uid}`),
+                clickUrl: link || NOTIF_PAGE
+            },
+            tokens: [token]
+        });
+
+        if (response.responses && response.responses.some(r => !r.success)) {
+            await removeInvalidTokens(response.responses, [token]);
+        }
+
+        return res.status(200).json({
+            success: true,
+            inApp:   true,
+            push:    response.successCount > 0,
+            sent:    response.successCount,
+            failed:  response.failureCount
+        });
+
+    } catch (error) {
+        console.error('Portal Notification Error:', error.message);
+        return res.status(500).json({ success: false, error: error.message });
+    }
 });
 
 
