@@ -851,11 +851,13 @@ app.post('/api/admin-push', async (req, res) => {
 
         const tokens = [];
         let noToken = 0;
+        let optedOut = 0;
         for (let i = 0; i < refs.length; i += 300) {
             const snaps = await db.getAll(...refs.slice(i, i + 300));
             snaps.forEach(snap => {
                 if (!snap.exists) { noToken++; return; }
-                if (!isPushAllowed(snap.data())) { noToken++; return; }
+                // 🔕 Push OFF hai — yeh "no device" se ALAG wajah hai, is liye alag ginte hain
+                if (!isPushAllowed(snap.data())) { optedOut++; return; }
                 const raw  = snap.data().fcmToken;
                 const list = (Array.isArray(raw) ? raw : [raw]).filter(t => t && String(t).length > 10);
                 if (!list.length) noToken++;
@@ -863,7 +865,7 @@ app.post('/api/admin-push', async (req, res) => {
             });
         }
         const unique = [...new Set(tokens)];
-        if (!unique.length) return res.status(200).json({ success: true, sent: 0, failed: 0, noToken });
+        if (!unique.length) return res.status(200).json({ success: true, sent: 0, failed: 0, noToken, optedOut });
 
         const tag = `admin_${Date.now()}`;
         let sent = 0, failed = 0;
@@ -893,7 +895,7 @@ app.post('/api/admin-push', async (req, res) => {
 
         if (allResponses.some(r => !r.success)) await removeInvalidTokens(allResponses, allTokens);
 
-        return res.status(200).json({ success: true, sent, failed, noToken });
+        return res.status(200).json({ success: true, sent, failed, noToken, optedOut });
 
     } catch (error) {
         console.error('Admin Push Error:', error.message);
