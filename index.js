@@ -832,13 +832,15 @@ app.post('/api/admin-push', async (req, res) => {
         if (!secret) return res.status(500).json({ error: 'PUSH_ADMIN_SECRET not configured on server' });
         if (req.get('x-push-admin-secret') !== secret) return res.status(401).json({ error: 'Unauthorized' });
 
-        const { uids, title, body, link } = req.body || {};
+        const { uids, title, body, link, imageUrl } = req.body || {};
         if (!Array.isArray(uids) || !uids.length) return res.status(400).json({ error: 'uids required' });
         if (uids.length > 1000)                   return res.status(400).json({ error: 'max 1000 uids per request' });
         if (!title || !String(title).trim())      return res.status(400).json({ error: 'title required' });
 
         const cleanTitle = stripHtml(title) || 'Health Jobs Portal';
         const cleanBody  = stripHtml(body).substring(0, 180);
+        // 🖼️ Sirf public https:// link accept — koi aur value SW mein chup-chaap ignore ho jati hai
+        const cleanImage = /^https:\/\/\S+$/i.test(String(imageUrl || '')) ? String(imageUrl) : '';
         // Sirf https:// ya /relative link; warna notifications page
         const clickUrl   = /^(https?:\/\/|\/)/i.test(String(link || '')) ? String(link) : NOTIF_PAGE;
 
@@ -877,6 +879,7 @@ app.post('/api/admin-push', async (req, res) => {
                     title:    cleanTitle,
                     body:     cleanBody,
                     icon:     LOGO_URL,
+                    image:    cleanImage,
                     tag,
                     clickUrl
                 },
@@ -928,9 +931,11 @@ app.post('/api/portal', async (req, res) => {
             title, body,
             link = '',
             icon = LOGO_URL,
+            image = '',
             tag  = '',
             fromName = 'Health Jobs Team'
         } = req.body || {};
+        const cleanImage = /^https:\/\/\S+$/i.test(String(image || '')) ? String(image) : '';
 
         if (!toUid && !toEmail) return res.status(400).json({ success: false, message: 'toUid or toEmail required' });
         if (!title || !String(title).trim()) return res.status(400).json({ success: false, message: 'title required' });
@@ -957,6 +962,7 @@ app.post('/api/portal', async (req, res) => {
             fromPic:   getIcon(icon),
             message:   cleanBody.substring(0, 300),
             title:     cleanTitle,
+            image:     cleanImage,
             link:      link || '',
             postId:    '',
             postSlug:  ''
@@ -977,6 +983,7 @@ app.post('/api/portal', async (req, res) => {
                 title:    cleanTitle,
                 body:     cleanBody.substring(0, 180),
                 icon:     getIcon(icon),
+                image:    cleanImage,
                 tag:      String(tag || `${type}_${uid}`),
                 clickUrl: link || NOTIF_PAGE
             },
